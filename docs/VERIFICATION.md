@@ -1,4 +1,4 @@
-# Verification runbook — G-gates (SPIKE, NOTHING VERIFIED YET)
+# Verification runbook — G-gates
 
 An ordered, on-hardware runbook. Run the gates **top to bottom**: each is the precondition
 for the next. The order is execution order, not gate-number order — the canonical numbers
@@ -9,47 +9,37 @@ Each gate states: *hypothesis · exact commands · pass/fail criteria · what a 
 Fill in a first-person observation (what you ran · what you saw · what surprised you ·
 verdict) when you actually execute it.
 
-> **STATUS: every gate below is UNVERIFIED.** This is a spike draft written from the Talos
-> sibling's verified recipe by analogy; not one k3s gate has been executed. The entries are
-> **hypotheses + test commands**, not observations. Per the sibling's rule: *don't pre-fill
-> gates not yet run* — each is marked `⛔ NOT RUN`. Replace with a real observation when run.
-
-> **Serialized after Talos.** Verification runs on a single MacBook Air; Apple `container`
-> boots one VM front at a time, so two VM-heavy spikes cannot run concurrently. The Talos
-> sibling's on-hardware pass runs first; this k3s runbook is queued behind it. Where a Talos
-> finding de-risks a k3s gate it is cited inline, but a Talos pass is **not** a k3s pass —
-> re-confirm on the k3s image.
-
 ---
 
-## G1 — does k3s's embedded containerd start under Apple `vminitd` with `--cap-add ALL`? ⛔ NOT RUN
+## G1 — does k3s's embedded containerd start under Apple `vminitd` with `--cap-add ALL`? ✅ VERIFIED 2026-06-26
 
-**BLOCKING — run this first. If G1 fails, STOP: do not run G2–G5, the whole k3s approach is
-dead, and the kiac choice (kubeadm + `kindest/node` over k3s) is vindicated.**
+**PASSED.** `rancher/k3s:v1.32.5-k3s1` booted under Apple `container` 1.0.0. Embedded
+containerd ran, full control plane came up, coredns pod running. Clean Kubernetes node name
+`k3sg1` (container DNS domain suffix dropped). Cluster accessible from the host via
+kubeconfig (server URL rewritten to the node IP). **`container exec` mangles entrypoint args**
+for the rancher/k3s image (the entrypoint runs `k3s` directly and exec prepends it again) —
+do not rely on `container exec` for arbitrary shell commands; use only for k3s subcommands
+that pass cleanly (sysctl, `k3s kubectl`). Use host-side kubeconfig access for everything
+else.
 
-- **Hypothesis:** the Talos sibling proved `--cap-add ALL` is the `Privileged: true`
-  equivalent and lets containerd/machined run under `vminitd`. k3s bundles its OWN
-  containerd (not the host's), which needs CAP_SYS_ADMIN for mount/pivot_root/cgroup setup.
-  Hypothesis: ALL caps are likewise sufficient for k3s's containerd. **This is the central
-  unknown** — and the one kiac may have hit when it picked kubeadm over k3s.
-- **Commands:**
-  ```sh
-  mkdir -p "$PWD/g1"
-  container run --detach --name g1 --cap-add ALL \
-    --tmpfs /run --tmpfs /tmp \
-    --volume "$PWD/g1:/var/lib/rancher/k3s" \
-    rancher/k3s:<tag> server --flannel-backend=host-gw --tls-san aegis-k3s.local
-  container logs g1                      # watch boot
-  container exec g1 k3s kubectl get nodes
-  container exec g1 k3s crictl info      # confirms the embedded containerd is up
-  ```
-- **Pass:** `container logs g1` shows containerd coming up and k3s reaching "Running
-  kube-apiserver" (no `failed to mount` / `operation not permitted` loop); `k3s crictl info`
-  returns runtime info; `k3s kubectl get nodes` shows the node `Ready`.
-- **Fail:** a mount/permission loop in the logs, `crictl` cannot reach containerd, or the
-  node never reaches `Ready`.
-- **On fail:** the approach is dead. k3s's embedded containerd cannot run under Apple
-  `vminitd` even with full caps. Stop here; do not run G2–G5.
+**Recipe used (now the baseline for G2/G3/G5):**
+
+```sh
+container run --detach --name k3sg1.aegis --cap-add ALL \
+  --tmpfs /run --tmpfs /tmp \
+  --volume aegis-k3sg1-k3s:/var/lib/rancher/k3s \
+  --label k3s.cluster.name=aegis --label k3s.owned=true \
+  --env K3S_TOKEN=<token> \
+  rancher/k3s:v1.32.5-k3s1 server \
+  --flannel-backend=host-gw \
+  --tls-san k3sg1.aegis
+container exec k3sg1.aegis k3s kubectl get nodes
+```
+
+**Image tag confirmed:** `rancher/k3s:v1.32.5-k3s1`. Use this exact tag; remove the
+`UNVERIFIED ASSUMPTION` comment from any docs that still carry it.
+
+---
 
 ## G4 — readiness probe: does `/readyz` answer (via in-node `k3s kubectl`) before the kubeconfig is host-fetchable? ⛔ NOT RUN
 
@@ -60,23 +50,22 @@ confirm the probe is correct before testing multi-node behavior.
   so readiness is polled from inside the node via `k3s kubectl get --raw /readyz` (returns
   `ok`). The in-node `k3s kubectl` uses `/etc/rancher/k3s/k3s.yaml`, which already trusts the
   local CA, so it answers `/readyz` before the host can fetch a working kubeconfig — making
-  exec the right gate, not an HTTPS GET from the host.
+  exec the right gate, not an HTTPS GET from the host. (Note: `container exec` works for k3s
+  subcommands despite the entrypoint mangling — only arbitrary shell commands are affected.)
 - **Commands:**
   ```sh
   # from launch, time how long until /readyz first returns ok
-  until container exec g1 k3s kubectl get --raw /readyz 2>/dev/null | grep -qx ok; do
+  until container exec <fqdn> k3s kubectl get --raw /readyz 2>/dev/null | grep -qx ok; do
     sleep 2; done; echo "ready"
-  container exec g1 sh -c 'command -v k3s'        # confirm k3s is on PATH this early
   # compare: an HTTPS GET from the host (expected to need -k / fail early)
   curl -ks "https://<node-ip>:6443/readyz"
   ```
-- **Pass:** the in-node `k3s kubectl get --raw /readyz` returns exactly `ok`; `k3s` is on
-  PATH from first boot; the probe goes green within the `readyTimeout` (120s) the code uses.
-- **Fail:** `/readyz` never returns `ok`, `k3s kubectl` is not on PATH early, or readiness
-  takes longer than `readyTimeout`.
-- **On fail:** fix the probe (different endpoint, longer timeout) before anything else —
-  Create cannot join agents without a correct readiness gate. Not a kill-switch for the
-  approach, but a kill-switch for the current orchestration.
+- **Pass:** the in-node `k3s kubectl get --raw /readyz` returns exactly `ok`; the probe
+  goes green within the `readyTimeout` (120s) the code uses.
+- **Fail:** `/readyz` never returns `ok` or readiness takes longer than `readyTimeout`.
+- **On fail:** fix the probe (different endpoint, longer timeout) before anything else.
+
+---
 
 ## G2 — does `--flannel-backend=host-gw` give working pod-to-pod across vmnet node-VMs? ⛔ NOT RUN
 
@@ -89,80 +78,82 @@ Run third: needs a server (G1) plus at least one agent, so it follows readiness.
   broken without it) — confirm that write actually sticks.
 - **Commands:**
   ```sh
-  container exec <server> sysctl net.ipv4.ip_forward     # expect = 1
+  container exec <server-fqdn> sysctl net.ipv4.ip_forward     # expect = 1
   # schedule a pod on each node, then test pod-to-pod across nodes:
-  container exec <server> k3s kubectl run a --image=busybox --restart=Never -- sleep 3600
-  container exec <server> k3s kubectl run b --image=busybox --restart=Never -- sleep 3600
-  container exec <server> k3s kubectl get pods -o wide    # confirm a/b on different nodes
-  container exec <server> k3s kubectl exec a -- ping -c3 <pod-b-ip>
-  # fallback probe if host-gw fails — is br_netfilter present for VXLAN?
-  container run --rm rancher/k3s:<tag> sh -c \
-    'grep br_netfilter /proc/filesystems; zcat /proc/config.gz 2>/dev/null | grep -i bridge_netfilter'
+  container exec <server-fqdn> k3s kubectl run a --image=busybox --restart=Never -- sleep 3600
+  container exec <server-fqdn> k3s kubectl run b --image=busybox --restart=Never -- sleep 3600
+  container exec <server-fqdn> k3s kubectl get pods -o wide    # confirm a/b on different nodes
+  container exec <server-fqdn> k3s kubectl exec a -- ping -c3 <pod-b-ip>
   ```
-- **Pass:** `ip_forward` reads `1`; a pod on the server reaches a pod on the agent across
-  nodes.
+- **Pass:** `ip_forward` reads `1`; a pod on the server reaches a pod on the agent.
 - **Fail:** cross-node pod traffic drops.
-- **On fail:** check the `br_netfilter` fallback probe. If `br_netfilter` is `=y`, switch the
-  server flag from `--flannel-backend=host-gw` to the default VXLAN backend and re-test. If
-  neither backend works, pod networking across vmnet node-VMs is unsolved for k3s.
+- **On fail:** check the `br_netfilter` fallback; switch to default VXLAN backend and re-test.
 
-## G3 — does the `--volume` datastore bind-mount persist `/var/lib/rancher/k3s` across stop/start AND rm? ⛔ NOT RUN
+---
 
-- **Hypothesis:** `container run` supports `-v/--volume`. A host bind-mount at
-  `/var/lib/rancher/k3s` makes the sqlite datastore survive both `container stop/start` and
-  `container rm`, where tmpfs would not. The Talos sibling's G5a/G5b will partly de-risk
-  host-dir persistence (it bind-mounts `/var` + `/system/state` on virtio-fs and tests
-  cold-restart survival of etcd) — but k3s uses **sqlite, not etcd**, so the failure modes
-  differ (no raft, single-writer file lock, different fsync pattern). Re-confirm on k3s.
+## G3 — does the named volume datastore persist `/var/lib/rancher/k3s` across stop/start AND rm? ⛔ NOT RUN
+
+**Updated:** the datastore is now an Apple `container` NAMED VOLUME (not a host-path
+bind-mount). Named volumes are block-backed ext4 owned by the guest root, so guest chmod
+works. Host-path bind-mounts (virtio-fs) rejected guest chmod — the same EPERM issue the
+Talos sibling hit on `/system/state`.
+
+- **Hypothesis:** `container volume create` creates a named volume that persists across
+  `container stop/start` and `container rm`. The sqlite datastore and all server state survive,
+  so a cold restart brings the cluster back intact.
 - **Commands:**
   ```sh
-  container exec <server> k3s kubectl create ns probe
-  container stop <server> && container start <server>
-  container exec <server> k3s kubectl get ns probe          # expect: still present
-  container rm -f <server>
-  # relaunch with the SAME --volume host dir:
-  container run --detach --name <server> --cap-add ALL --tmpfs /run --tmpfs /tmp \
-    --volume "<stateDir>/<cluster>/<server>/k3s:/var/lib/rancher/k3s" \
-    --env K3S_TOKEN=<token> rancher/k3s:<tag> server --flannel-backend=host-gw --tls-san aegis-k3s.local
-  container exec <server> k3s kubectl get ns probe          # expect: still present
+  # with a running server (from G2):
+  container exec <server-fqdn> k3s kubectl create ns probe
+  container stop <server-fqdn> && container start <server-fqdn>
+  container exec <server-fqdn> k3s kubectl get ns probe          # expect: still present
+  container rm -f <server-fqdn>
+  # relaunch with the SAME named volume (provisioner does this automatically on restart):
+  container run --detach --name <server-fqdn> --cap-add ALL \
+    --tmpfs /run --tmpfs /tmp \
+    --volume <cluster>-<server>-k3s:/var/lib/rancher/k3s \
+    --env K3S_TOKEN=<token> rancher/k3s:v1.32.5-k3s1 server \
+    --flannel-backend=host-gw --tls-san <server-fqdn>
+  container exec <server-fqdn> k3s kubectl get ns probe          # expect: still present
   ```
 - **Pass:** namespace `probe` survives both stop/start and a full `rm` + relaunch onto the
-  same host dir — proving state lives in the host dir, not the container.
-- **Fail:** `probe` is gone after stop/start (datastore was not on the bind-mount) or after
-  `rm` + relaunch (host dir not persisted / not re-attached).
-- **On fail:** the persistence design is broken; the datastore is not actually on the host
-  bind-mount. Re-check the `--volume` flag form and that `/var` is not being shadowed by a
-  tmpfs. Without this, G5 cannot pass.
+  same named volume — proving state lives in the named volume, not the container layer.
+- **Fail:** `probe` is gone, meaning the datastore is not persisted in the named volume.
+- **On fail:** check whether `container volume create` + `--volume <name>:` persists data
+  across rm (named-volume semantics should guarantee this). If named volumes do NOT persist,
+  the whole persistence design needs rethinking.
 
-## G5 — IP-change recovery: does persisted sqlite + `--tls-san` survive a cold restart on a new IP? ⛔ NOT RUN
+---
 
-The payoff gate for the sqlite + `--tls-san` design choice. Run last; needs G3.
+## G5 — FQDN endpoint + named volume: does the single-server cluster survive a cold restart on a new IP? ⛔ NOT RUN
 
-- **Hypothesis:** the Talos sibling found vmnet DHCP moves IPs across cold restart with no
-  static lever, and a Talos node came back BLANK (tmpfs state wiped). k3s should do better:
-  sqlite has no IP-bound membership (unlike embedded etcd, which encodes peer/client URLs),
-  and `--tls-san aegis-k3s.local` pins a stable name into the API server cert SANs so the
-  cert stays valid when the DHCP IP changes. So a single-server cluster *should* recover from
-  a cold restart even on a new IP. Open question: do agents need re-pointing? `K3S_URL` is
-  baked at agent launch, so a new server IP may strand them.
+The combined payoff gate for the sqlite + FQDN design. Run last; needs G3.
+
+- **Hypothesis:** with `--tls-san <server-fqdn>` the API server cert covers the FQDN. After
+  a cold restart the vmnet DHCP IP changes, but Apple's container DNS (`container system dns
+  create aegis`) re-registers the FQDN to the new IP — so host-side FQDN access stays valid.
+  sqlite has no IP-bound membership (unlike embedded etcd), so the datastore is intact.
+  Agent nodes join via `K3S_URL=https://<server-fqdn>:6443` — this URL stays stable too.
 - **Commands:**
   ```sh
-  # healthy 1-server + 1-agent cluster, then force new DHCP IPs:
-  container stop <server> <agent>
-  container start <server> <agent>
-  container inspect <server> | grep ipv4Address           # confirm the IP actually changed
-  container exec <server> k3s kubectl get --raw /readyz    # expect: ok (cert still valid via SAN)
-  container exec <server> k3s kubectl get nodes            # is the agent Ready, or NotReady?
+  # healthy 1-server + 1-agent cluster, then cold restart:
+  container stop <server-fqdn> <agent-fqdn>
+  container start <server-fqdn> <agent-fqdn>
+  container inspect <server-fqdn> | grep ipv4Address           # confirm the IP changed
+  # host-side FQDN access (stable because DNS re-registers):
+  curl -ks https://<server-fqdn>:6443/readyz                   # expect: ok
+  container exec <server-fqdn> k3s kubectl get nodes            # expect: both Ready
+  KUBECONFIG=./kubeconfig kubectl get nodes                     # expect: works via FQDN URL
   ```
-- **Pass:** the server API comes back (cert valid via the stable SAN, datastore intact via
-  the G3 bind-mount); EITHER the agent rejoins on its own, OR you document the exact step to
-  re-point it (`K3S_URL` updated to the new server IP).
-- **Fail:** the server API does not come back (cert SAN mismatch or lost datastore), or the
-  agent cannot be recovered at all.
-- **On fail:** if the server fails, restart survival needs more than sqlite + `--tls-san`
-  (likely an upstream static-IP / DHCP-reservation in `container`, the same gap the Talos
-  sibling documents). If only the agent fails, document the re-point procedure — that is an
-  acceptable, honest limitation for a single-server spike.
+- **Pass:** API comes back via FQDN (cert valid via SAN, IP changed); agent rejoins; host
+  kubeconfig (pointing at the FQDN) continues working.
+- **Fail scenarios:**
+  - API cert SAN mismatch — the FQDN was not included in `--tls-san`. Fix: confirm the
+    FQDN matches exactly what was baked into `--tls-san` at create time.
+  - DNS not updated — Apple container DNS did not re-register after restart. Check: was
+    `sudo container system dns create aegis` run after the last macOS reboot?
+  - Agent stuck NotReady — re-pointing `K3S_URL` to the FQDN is a no-op since the FQDN
+    is already the agent's join endpoint; if it fails, check DHCP reconvergence timing.
 
 ---
 

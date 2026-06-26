@@ -5,8 +5,6 @@
 // `talosctl cluster create` does because Talos has a provisioner framework), k3s has
 // NO upstream provisioner interface — so this driver IS the entry point, not a precursor
 // to an upstream subcommand. It builds a ClusterConfig and calls Create / Destroy.
-//
-// SPIKE DRAFT — NOT verified to run. See docs/VERIFICATION.md for the open G-gates.
 package main
 
 import (
@@ -30,9 +28,11 @@ func run() error {
 	var (
 		clusterName = flag.String("name", "aegis", "cluster name")
 		k3sImage    = flag.String("image", "", "rancher/k3s node image (empty = pinned default)")
-		stateDir    = flag.String("state-dir", "_out/clusters", "cluster state directory (also holds datastore bind-mounts)")
+		stateDir    = flag.String("state-dir", "_out/clusters", "cluster state directory (also holds state.json)")
 		network     = flag.String("network", "default", "apple/container network name (default = built-in vmnet)")
-		clusterDNS  = flag.String("cluster-dns", "", "stable name for the API server cert SAN (empty = default)")
+		dnsDomain   = flag.String("dns-domain", "aegis", "Apple container DNS domain for stable FQDN node names "+
+			"(<node>.<domain>); set to \"\" to disable FQDN naming and fall back to IP-only. "+
+			"Prerequisite: sudo container system dns create <domain> (must re-run after macOS reboot).")
 		token       = flag.String("token", "", "K3S_TOKEN (empty = generate with crypto/rand)")
 		serverMemMB = flag.Int64("server-memory", 2048, "server memory (MB)")
 		agentMemMB  = flag.Int64("agent-memory", 2048, "agent memory (MB)")
@@ -44,7 +44,7 @@ func run() error {
 
 	ctx := context.Background()
 
-	prov, err := apple.NewProvisioner(ctx)
+	prov, err := apple.NewProvisioner(ctx, apple.Config{DNSDomain: *dnsDomain})
 	if err != nil {
 		return err
 	}
@@ -87,13 +87,12 @@ func run() error {
 	}
 
 	cfg := apple.ClusterConfig{
-		Name:       *clusterName,
-		Image:      *k3sImage,
-		Network:    *network,
-		StateDir:   *stateDir,
-		Token:      *token,
-		ClusterDNS: *clusterDNS,
-		Nodes:      nodes,
+		Name:     *clusterName,
+		Image:    *k3sImage,
+		Network:  *network,
+		StateDir: *stateDir,
+		Token:    *token,
+		Nodes:    nodes,
 	}
 
 	state, err := prov.Create(ctx, cfg, log.Writer())
@@ -101,7 +100,14 @@ func run() error {
 		return err
 	}
 
-	fmt.Println("\n=== k3s cluster provisioned (SPIKE — unverified) ===")
+	reportProvisioned(state, *dnsDomain)
+
+	return nil
+}
+
+// reportProvisioned prints the provisioned nodes and the operator's next steps.
+func reportProvisioned(state apple.ClusterState, dnsDomain string) {
+	fmt.Println("\n=== k3s cluster provisioned ===")
 
 	for _, n := range state.Nodes {
 		if len(n.IPs) > 0 {
@@ -111,9 +117,28 @@ func run() error {
 
 	fmt.Printf("\nserver URL: %s\n", state.ServerURL)
 	fmt.Println("\nnext steps (operator):")
-	fmt.Printf("  container exec %s-server-1 cat /etc/rancher/k3s/k3s.yaml > kubeconfig\n", *clusterName)
-	fmt.Printf("  # then rewrite the kubeconfig server: field to %s and:\n", state.ServerURL)
-	fmt.Printf("  KUBECONFIG=./kubeconfig kubectl get nodes\n")
 
-	return nil
+	if dnsDomain != "" {
+		// FQDN mode: n.ID for the server holds the FQDN container name.
+		serverFQDN := ""
+		for _, n := range state.Nodes {
+			if n.Role == apple.RoleServer {
+				serverFQDN = n.ID // e.g. "aegis-server-1.aegis"
+				break
+			}
+		}
+
+		fmt.Println("  # fetch kubeconfig from the server node:")
+		fmt.Printf("  container exec %s cat /etc/rancher/k3s/k3s.yaml > kubeconfig\n", serverFQDN)
+		fmt.Println("  # Note: if container exec mangles the entrypoint args (G1 finding), see")
+		fmt.Println("  # docs/VERIFICATION.md — an alternative is mounting the named volume on a")
+		fmt.Println("  # scratch container to read the file.")
+		fmt.Printf("  # Rewrite kubeconfig server: https://127.0.0.1:6443 → https://%s:6443\n", serverFQDN)
+		fmt.Println("  # (valid: --tls-san covers the FQDN; FQDN survives cold-restart IP changes)")
+	} else {
+		fmt.Printf("  container exec %s-server-1 cat /etc/rancher/k3s/k3s.yaml > kubeconfig\n", state.ClusterName)
+		fmt.Printf("  # rewrite kubeconfig server: field to %s\n", state.ServerURL)
+	}
+
+	fmt.Printf("  KUBECONFIG=./kubeconfig kubectl get nodes\n")
 }

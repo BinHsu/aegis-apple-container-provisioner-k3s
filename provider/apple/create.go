@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"os"
 	"strconv"
 	"time"
 )
@@ -18,15 +17,14 @@ import (
 // Lifecycle (mirrors the Talos sibling's create.go shape, but encodes the k3s-specific
 // server-first + readiness-gate ordering that Talos got from its framework):
 //
-//	validate -> ensureNetwork -> launch SERVER (sqlite, host-gw, tls-san, K3S_TOKEN preset)
+//	validate -> ensureNetwork -> DNS domain precheck
+//	  -> prepareNodeVolumes (create named volumes, stale-state guard)
+//	  -> launch SERVER (sqlite, host-gw, tls-san, K3S_TOKEN preset)
 //	  -> waitForIPv4(server) -> exec sysctl ip_forward=1 -> wait k3s READY (/readyz)
-//	  -> for each AGENT: launch (K3S_URL + K3S_TOKEN) -> waitForIPv4 -> exec sysctl
+//	  -> for each AGENT: launch (K3S_URL=FQDN + K3S_TOKEN) -> waitForIPv4 -> exec sysctl
 //	  -> assertDistinctIPs -> saveState
 //
 // `container run` pulls the image on demand, so there is no explicit image-pull step.
-//
-// SPIKE DRAFT — this orchestration has NOT been run. Each step is a hypothesis gated in
-// docs/VERIFICATION.md (G1 caps/containerd, G4 readiness, etc.).
 func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Writer) (ClusterState, error) {
 	if logw == nil {
 		logw = io.Discard
@@ -46,10 +44,6 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		cfg.Token = tok
 	}
 
-	if cfg.ClusterDNS == "" {
-		cfg.ClusterDNS = defaultClusterDNS
-	}
-
 	if cfg.Image == "" {
 		cfg.Image = defaultK3sImage
 	}
@@ -60,11 +54,26 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		return ClusterState{}, fmt.Errorf("ensuring network: %w", err)
 	}
 
-	// Create each node's datastore bind-mount dir on the host, and refuse to boot onto
-	// stale state from a prior run (see prepareNodeDatastores). apple/container's --volume
-	// needs the host path to exist (UNVERIFIED whether it auto-creates; we create it to be
-	// safe — gate G3).
-	if err := prepareNodeDatastores(cfg); err != nil {
+	// DNS domain precheck: if FQDN-endpoint mode is enabled, the resolver entry must
+	// exist before containers are launched. A missing entry means host-to-container FQDN
+	// lookups silently fall through to public DNS — the cluster would come up but the
+	// stable-endpoint goal is not met. Failing early avoids a hard-to-diagnose
+	// connectivity gap after a (successful) create. Mirrors the Talos sibling.
+	if p.dnsDomain != "" {
+		if err := p.checkDNSDomain(ctx, p.dnsDomain); err != nil {
+			return ClusterState{}, err
+		}
+	}
+
+	// Create each node's k3s datastore named volume before launch, and refuse to boot
+	// onto stale state from a prior run (see prepareNodeVolumes). Volumes are stamped
+	// with the cluster labels so the destroy label sweep can reclaim them even if this
+	// Create fails before saveState (the half-created-cluster gap).
+	createVolume := func(ctx context.Context, name string) error {
+		return p.volumeCreate(ctx, name, volumeLabels(cfg.Name)...)
+	}
+
+	if err := prepareNodeVolumes(ctx, cfg.Name, cfg.Nodes, p.volumeExists, createVolume); err != nil {
 		return ClusterState{}, err
 	}
 
@@ -94,11 +103,20 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		return ClusterState{}, fmt.Errorf("server %q readiness: %w", server.Name, err)
 	}
 
-	serverURL := "https://" + net.JoinHostPort(serverIP.String(), strconv.Itoa(k3sAPIPort))
+	// 4) Compute the server URL: use the FQDN endpoint when dns-domain is set so agents
+	// join via a stable name that survives cold-restart IP changes; fall back to the
+	// current DHCP IP in IP-only mode.
+	var serverURL string
+	if p.dnsDomain != "" {
+		serverFQDN := nodeFQDN(server.Name, p.dnsDomain)
+		serverURL = "https://" + net.JoinHostPort(serverFQDN, strconv.Itoa(k3sAPIPort))
+	} else {
+		serverURL = "https://" + net.JoinHostPort(serverIP.String(), strconv.Itoa(k3sAPIPort))
+	}
 
 	nodes := []NodeInfo{serverInfo}
 
-	// 4) Launch AGENT nodes pointed at the server.
+	// 5) Launch AGENT nodes pointed at the server.
 	for _, agent := range agents {
 		fmt.Fprintln(logw, "launching k3s agent", agent.Name, "->", serverURL)
 
@@ -139,14 +157,17 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 
 // launchNode runs one node and returns its NodeInfo once it has a vmnet IP.
 func (p *provisioner) launchNode(ctx context.Context, cfg ClusterConfig, node NodeConfig, serverURL string) (NodeInfo, error) {
-	args := buildRunArgs(cfg, node, serverURL)
+	args := buildRunArgs(cfg, node, serverURL, p.dnsDomain)
 
 	if _, err := p.run(ctx, args...); err != nil {
 		return NodeInfo{}, fmt.Errorf("launching node %q: %w", node.Name, err)
 	}
 
-	// apple/container uses --name as the container ID (Talos sibling finding).
-	id := node.Name
+	// The container ID is the --name we passed: FQDN when a DNS domain is set, bare name
+	// otherwise. NodeInfo.ID carries this so stop/remove/inspect all use the right handle.
+	// NodeInfo.Name stays as the bare node name so volume naming (nodeVolumeName) and
+	// destroy label-sweep both derive the same identifiers as at create time.
+	id := nodeFQDN(node.Name, p.dnsDomain)
 
 	addr, err := p.waitForIPv4(ctx, id)
 	if err != nil {
@@ -162,8 +183,7 @@ func (p *provisioner) launchNode(ctx context.Context, cfg ClusterConfig, node No
 }
 
 // enableIPForward sets net.ipv4.ip_forward=1 inside a node. Mandatory for k3s pod
-// networking; the kiac spike proved it. UNVERIFIED that `container exec ... sysctl`
-// works and that the guest kernel permits the write even with --cap-add ALL (G1/G4).
+// networking; the kiac spike proved it.
 func (p *provisioner) enableIPForward(ctx context.Context, id string) error {
 	if _, err := p.exec(ctx, id, "sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
 		return fmt.Errorf("enabling ip_forward: %w", err)
@@ -182,8 +202,7 @@ const readyTimeout = 120 * time.Second
 // GET to https://<ip>:6443/readyz from the host would need TLS handling (the server CA
 // is not yet fetchable as a kubeconfig at this point in bring-up). The in-node
 // `k3s kubectl` uses /etc/rancher/k3s/k3s.yaml, which already trusts the local CA, so it
-// is the simplest correct probe. UNVERIFIED that /readyz returns "ok" before the
-// kubeconfig is host-fetchable, and that `k3s kubectl` is on PATH this early (G4).
+// is the simplest correct probe.
 func (p *provisioner) waitForReady(ctx context.Context, id string) error {
 	deadline := time.Now().Add(readyTimeout)
 
@@ -248,53 +267,47 @@ func validateClusterConfig(cfg ClusterConfig) error {
 	return nil
 }
 
-// prepareNodeDatastores creates the host bind-mount directory for each node's persistent
-// datastore (/var/lib/rancher/k3s), and guards against booting onto stale state.
+// prepareNodeVolumes creates each node's k3s datastore named volume, and guards
+// against booting onto stale state.
 //
-// The guard is the load-bearing consequence of using a persistent host bind-mount instead
-// of tmpfs: a datastore dir left non-empty by a prior run carries an old sqlite database
-// (server) or old kubelet/agent state. Reusing either silently would resurrect a stale,
-// half-broken cluster (wrong certs, divergent state) rather than boot a clean one. We
-// refuse and tell the operator to destroy first — never silently reuse (surprise stale
-// boot) and never silently wipe. This mirrors the Talos sibling's prepareNodeVolumes.
-func prepareNodeDatastores(cfg ClusterConfig) error {
-	for _, node := range cfg.Nodes {
-		dir := nodeDatastoreHostPath(cfg, node)
+// The guard is the load-bearing consequence of using named volumes: a volume left behind
+// by a prior run carries an old sqlite database (server) or old kubelet/agent state.
+// Reusing either silently would resurrect a stale, half-broken cluster (wrong certs,
+// divergent state) rather than boot a clean one. We refuse and tell the operator to
+// destroy first — never silent reuse, never silent wipe. Mirrors the Talos sibling's
+// prepareNodeVolumes.
+//
+// exists/create are injected (p.volumeExists / p.volumeCreate in production) so the
+// guard is unit-testable without the `container` CLI.
+func prepareNodeVolumes(
+	ctx context.Context,
+	clusterName string,
+	nodes []NodeConfig,
+	exists func(context.Context, string) (bool, error),
+	create func(context.Context, string) error,
+) error {
+	for _, node := range nodes {
+		vol := nodeVolumeName(clusterName, node.Name)
 
-		empty, err := dirIsEmpty(dir)
+		present, err := exists(ctx, vol)
 		if err != nil {
-			return fmt.Errorf("checking datastore dir %q for node %q: %w", dir, node.Name, err)
+			return fmt.Errorf("checking volume %q for node %q: %w", vol, node.Name, err)
 		}
 
-		if !empty {
+		if present {
 			return fmt.Errorf(
-				"node %q: datastore dir %q already exists and is not empty (stale state from a prior run); "+
-					"run destroy for this cluster first — refusing to reuse or wipe it",
-				node.Name, dir,
+				"node %q: named volume %q already exists (stale state from a prior run); "+
+					"run destroy for this cluster first — refusing to reuse it",
+				node.Name, vol,
 			)
 		}
 
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("creating datastore dir %q for node %q: %w", dir, node.Name, err)
+		if err := create(ctx, vol); err != nil {
+			return fmt.Errorf("creating volume %q for node %q: %w", vol, node.Name, err)
 		}
 	}
 
 	return nil
-}
-
-// dirIsEmpty reports whether dir is empty. A not-yet-existing dir counts as empty (nothing
-// stale). Carried over verbatim from the Talos sibling.
-func dirIsEmpty(dir string) (bool, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return true, nil
-		}
-
-		return false, err
-	}
-
-	return len(entries) == 0, nil
 }
 
 // assertDistinctIPs fails if any two nodes share an IP (everyday-correctness regression
