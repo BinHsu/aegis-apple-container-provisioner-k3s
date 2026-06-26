@@ -3,11 +3,14 @@
 package apple
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -20,7 +23,9 @@ import (
 //	validate -> ensureNetwork -> DNS domain precheck
 //	  -> prepareNodeVolumes (create named volumes, stale-state guard)
 //	  -> launch SERVER (sqlite, host-gw, tls-san, K3S_TOKEN preset)
-//	  -> waitForIPv4(server) -> exec sysctl ip_forward=1 -> wait k3s READY (/readyz)
+//	  -> waitForIPv4(server) -> exec sysctl ip_forward=1
+//	  -> poll k3s.yaml via container cp (readiness signal + kubeconfig delivery)
+//	  -> rewrite kubeconfig server URL -> save to <stateDir>/<cluster>/kubeconfig
 //	  -> for each AGENT: launch (K3S_URL=FQDN + K3S_TOKEN) -> waitForIPv4 -> exec sysctl
 //	  -> assertDistinctIPs -> saveState
 //
@@ -96,23 +101,43 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		return ClusterState{}, fmt.Errorf("server %q: %w", server.Name, err)
 	}
 
-	// 3) Wait for the k3s API to report ready before joining agents.
-	fmt.Fprintln(logw, "waiting for k3s server readiness on", serverIP)
+	// 3) Wait for k3s to initialize by polling `container cp` for k3s.yaml.
+	// k3s writes /etc/rancher/k3s/k3s.yaml only once the API server is fully up, so a
+	// successful cp is a reliable "server is up" signal. It also delivers the kubeconfig
+	// in one shot — no separate fetch step. Ensure the cluster state dir exists first.
+	clusterDir := filepath.Join(cfg.StateDir, cfg.Name)
+	if err := os.MkdirAll(clusterDir, 0o755); err != nil {
+		return ClusterState{}, fmt.Errorf("creating cluster state dir %q: %w", clusterDir, err)
+	}
 
-	if err := p.waitForReady(ctx, serverInfo.ID); err != nil {
+	kubeconfigPath := filepath.Join(clusterDir, "kubeconfig")
+
+	fmt.Fprintln(logw, "waiting for k3s to initialize (polling k3s.yaml via container cp)")
+
+	if err := p.waitForReady(ctx, serverInfo.ID, kubeconfigPath); err != nil {
 		return ClusterState{}, fmt.Errorf("server %q readiness: %w", server.Name, err)
 	}
 
-	// 4) Compute the server URL: use the FQDN endpoint when dns-domain is set so agents
-	// join via a stable name that survives cold-restart IP changes; fall back to the
-	// current DHCP IP in IP-only mode.
+	// 4) Compute the server URL, then rewrite the kubeconfig's loopback server address.
+	// k3s always writes https://127.0.0.1:6443; rewrite to the FQDN (stable across
+	// cold-restart IP changes when dns-domain is set) or the current DHCP IP otherwise.
 	var serverURL string
 	if p.dnsDomain != "" {
-		serverFQDN := nodeFQDN(server.Name, p.dnsDomain)
-		serverURL = "https://" + net.JoinHostPort(serverFQDN, strconv.Itoa(k3sAPIPort))
+		serverURL = "https://" + net.JoinHostPort(nodeFQDN(server.Name, p.dnsDomain), strconv.Itoa(k3sAPIPort))
 	} else {
 		serverURL = "https://" + net.JoinHostPort(serverIP.String(), strconv.Itoa(k3sAPIPort))
 	}
+
+	raw, err := os.ReadFile(kubeconfigPath)
+	if err != nil {
+		return ClusterState{}, fmt.Errorf("reading fetched kubeconfig: %w", err)
+	}
+
+	if err := os.WriteFile(kubeconfigPath, rewriteKubeconfigServer(raw, serverURL), 0o600); err != nil {
+		return ClusterState{}, fmt.Errorf("writing kubeconfig %q: %w", kubeconfigPath, err)
+	}
+
+	fmt.Fprintf(logw, "kubeconfig saved to %s\n", kubeconfigPath)
 
 	nodes := []NodeInfo{serverInfo}
 
@@ -192,36 +217,50 @@ func (p *provisioner) enableIPForward(ctx context.Context, id string) error {
 	return nil
 }
 
-// readyTimeout bounds how long we wait for the k3s server to report ready.
+// readyTimeout bounds how long we wait for the k3s server to initialize.
 const readyTimeout = 120 * time.Second
 
-// waitForReady polls k3s readiness from INSIDE the server node via
-// `k3s kubectl get --raw /readyz`.
+// waitForReady polls until the k3s server has written /etc/rancher/k3s/k3s.yaml. k3s
+// only creates this file once the API server is fully initialized (CA issued,
+// control-plane healthy), so a successful `container cp` is a reliable "server is up"
+// signal. The file is written directly to kubeconfigPath, so the caller can immediately
+// rewrite the server URL and hand it to the operator — no separate fetch step needed.
 //
-// Why exec-and-not-HTTPS (decided, see G4): there is no systemd to query, and an HTTPS
-// GET to https://<ip>:6443/readyz from the host would need TLS handling (the server CA
-// is not yet fetchable as a kubeconfig at this point in bring-up). The in-node
-// `k3s kubectl` uses /etc/rancher/k3s/k3s.yaml, which already trusts the local CA, so it
-// is the simplest correct probe.
-func (p *provisioner) waitForReady(ctx context.Context, id string) error {
+// WHY cp AND NOT exec: `container exec` mangles the rancher/k3s multi-call binary's args.
+// `container exec <id> k3s kubectl get --raw /readyz` produces "unknown command 'kubectl'
+// for 'kubectl'" — verified on G1 hardware 2026-06-26. `container cp` has no such
+// restriction; it copies the file directly from the container filesystem.
+func (p *provisioner) waitForReady(ctx context.Context, id, kubeconfigPath string) error {
 	deadline := time.Now().Add(readyTimeout)
+	src := id + ":/etc/rancher/k3s/k3s.yaml"
 
 	for {
-		out, err := p.exec(ctx, id, "k3s", "kubectl", "get", "--raw", "/readyz")
-		if err == nil && out == "ok" {
+		if err := p.containerCP(ctx, src, kubeconfigPath); err == nil {
 			return nil
 		}
 
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for /readyz (last: %q, err: %v)", out, err)
+			return fmt.Errorf(
+				"timed out after %s: k3s.yaml not yet written by %q (server may still be initializing)",
+				readyTimeout, id,
+			)
 		}
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(5 * time.Second):
 		}
 	}
+}
+
+// rewriteKubeconfigServer replaces every occurrence of the k3s loopback server address
+// (https://127.0.0.1:6443) in a fetched kubeconfig with newServerURL. k3s always writes
+// the loopback as the server address; this substitution makes the kubeconfig usable from
+// the host. Extracted as a pure function so the replacement is unit-testable without the
+// container CLI.
+func rewriteKubeconfigServer(in []byte, newServerURL string) []byte {
+	return bytes.ReplaceAll(in, []byte("https://127.0.0.1:6443"), []byte(newServerURL))
 }
 
 // splitRoles returns the single server node and the agent nodes. validateClusterConfig

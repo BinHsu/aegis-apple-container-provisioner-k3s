@@ -56,15 +56,31 @@ func (p *provisioner) run(ctx context.Context, args ...string) (string, error) {
 // exec runs a command inside a node via `container exec <id> <args...>` and returns
 // trimmed stdout. Used for:
 //   - sysctl net.ipv4.ip_forward=1 (mandatory; the kiac spike proved it)
-//   - readiness polling via `k3s kubectl get --raw /readyz`
 //
-// Note (G1 hardware finding): `container exec` may mangle args for containers whose
-// entrypoint runs k3s directly — use only for commands that pass cleanly. The readiness
-// probe and sysctl call have been verified not to hit this mangling.
+// G1 HARDWARE FINDING (2026-06-26): `container exec` mangles args for the rancher/k3s
+// image because k3s is a multi-call binary (kubectl and crictl are symlinks to the same
+// k3s binary). The container entrypoint runs k3s directly; exec prepends it again, so
+// `container exec <id> k3s kubectl ...` becomes effectively `k3s k3s kubectl ...` and
+// fails with "unknown command 'kubectl' for 'kubectl'". Only use exec for commands whose
+// first argument is NOT a k3s multi-call subcommand — sysctl passes cleanly because it
+// is a separate system binary, not a k3s symlink. Readiness is probed via containerCP
+// (see waitForReady in create.go), which has no such restriction.
 func (p *provisioner) exec(ctx context.Context, id string, args ...string) (string, error) {
 	full := append([]string{"exec", id}, args...)
 
 	return p.run(ctx, full...)
+}
+
+// containerCP copies a path from inside a container to the host via
+// `container cp <src> <dst>`. The primary use is the readiness probe in waitForReady:
+// k3s writes /etc/rancher/k3s/k3s.yaml only once the API server is fully initialized
+// (CA issued, control-plane healthy), so a successful cp is a reliable "server is up"
+// signal — and simultaneously delivers the operator's kubeconfig without relying on
+// `container exec` (which mangles the rancher/k3s multi-call binary's args).
+func (p *provisioner) containerCP(ctx context.Context, src, dst string) error {
+	_, err := p.run(ctx, "cp", src, dst)
+
+	return err
 }
 
 // containerInspect is the minimal subset of `container inspect <id>` JSON we consume.

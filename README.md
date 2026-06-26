@@ -75,7 +75,7 @@ go run ./cmd/aegis-k3s -dns-domain "" -name aegis -agents 1
 validate → ensureNetwork → DNS domain precheck
   → prepareNodeVolumes (create named volumes, stale-state guard)
   → launch SERVER (sqlite + host-gw + tls-san=<server-fqdn> + K3S_TOKEN)
-  → waitForIPv4 → exec sysctl ip_forward=1 → poll /readyz via in-node k3s kubectl
+  → waitForIPv4 → exec sysctl ip_forward=1 → poll k3s.yaml via container cp (readiness + kubeconfig delivery)
   → launch each AGENT (K3S_URL=https://<server-fqdn>:6443 + K3S_TOKEN)
   → waitForIPv4 → exec sysctl → saveState
 ```
@@ -93,19 +93,28 @@ destroy: stop + rm each node (by FQDN container ID from saved state)
 
 ## Access pattern: host kubeconfig
 
-`container exec` mangles entrypoint args for the rancher/k3s image (the entrypoint runs
-`k3s` directly; exec prepends it again). Fetch the kubeconfig via exec-cat (which does
-NOT trigger the mangling) and rewrite the server URL:
+The provisioner writes a ready-to-use kubeconfig to `<stateDir>/<cluster>/kubeconfig`
+(default: `_out/clusters/<cluster>/kubeconfig`) during create — no manual fetch or
+server-URL rewrite needed:
 
 ```sh
-container exec aegis-server-1.aegis cat /etc/rancher/k3s/k3s.yaml > kubeconfig
-# Rewrite the server URL from the loopback to the FQDN:
-sed -i '' 's|https://127.0.0.1:6443|https://aegis-server-1.aegis:6443|' kubeconfig
-KUBECONFIG=./kubeconfig kubectl get nodes
+export KUBECONFIG=_out/clusters/aegis/kubeconfig
+kubectl get nodes
 ```
 
-The FQDN URL is valid because `--tls-san aegis-server-1.aegis` was baked into the API
-server cert at create time. The FQDN survives cold-restart IP changes (gate G5).
+**What the provisioner does:** after the server starts, it polls `container cp
+<server-fqdn>:/etc/rancher/k3s/k3s.yaml` until k3s writes the file (a reliable
+initialization signal — k3s only creates `k3s.yaml` once the API server is up and the CA
+has been issued). It then rewrites the server address from the loopback
+(`https://127.0.0.1:6443`) to the FQDN endpoint (`https://<server-fqdn>:6443`), which is
+valid because `--tls-san` covers the FQDN. The FQDN endpoint survives cold-restart IP
+changes (gate G5).
+
+**Why `container cp` and not `container exec`:** `container exec` mangles the rancher/k3s
+multi-call binary's args. `k3s kubectl`, `k3s crictl`, etc. are all symlinks to the same
+`k3s` binary; `container exec <id> k3s kubectl ...` produces
+`unknown command "kubectl" for "kubectl"` — verified 2026-06-26. `container cp` has no
+such restriction and copies the file directly from the container filesystem.
 
 ## Usage
 

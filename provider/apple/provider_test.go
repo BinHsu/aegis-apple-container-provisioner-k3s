@@ -3,6 +3,7 @@
 package apple
 
 import (
+	"bytes"
 	"context"
 	"net/netip"
 	"slices"
@@ -400,6 +401,62 @@ func TestDNSDomainDefault(t *testing.T) {
 	// We lock the value here so a refactor that changes the default breaks this test.
 	if wantDefault == "" {
 		t.Error("dns-domain default must be non-empty (FQDN mode should be the default)")
+	}
+}
+
+// TestRewriteKubeconfigServer verifies the pure kubeconfig server-URL rewrite helper.
+// BVA on the replacement boundary (CLAUDE.md k):
+//   - B   (loopback present): 127.0.0.1:6443 is replaced by the new endpoint.
+//   - B-1 (no loopback): input is returned unchanged (idempotent on an already-rewritten kubeconfig).
+//
+// Two endpoint variants are tested — FQDN mode and IP-only mode (-dns-domain "") — to
+// confirm both paths produce a usable, non-loopback server address.
+func TestRewriteKubeconfigServer(t *testing.T) {
+	loopbackKubeconfig := []byte("    server: https://127.0.0.1:6443\n    certificate-authority-data: abc\n")
+	alreadyRewritten := []byte("    server: https://aegis-server-1.aegis:6443\n")
+
+	tests := []struct {
+		name         string
+		in           []byte
+		newServerURL string
+		wantContains string
+		wantAbsent   string
+	}{
+		{
+			name:         "FQDN endpoint replaces loopback (FQDN mode)",
+			in:           loopbackKubeconfig,
+			newServerURL: "https://aegis-server-1.aegis:6443",
+			wantContains: "https://aegis-server-1.aegis:6443",
+			wantAbsent:   "https://127.0.0.1:6443",
+		},
+		{
+			name:         "IP endpoint replaces loopback (IP-only mode, -dns-domain \"\")",
+			in:           loopbackKubeconfig,
+			newServerURL: "https://192.168.64.5:6443",
+			wantContains: "https://192.168.64.5:6443",
+			wantAbsent:   "https://127.0.0.1:6443",
+		},
+		{
+			name:         "no loopback present: output unchanged (already rewritten)",
+			in:           alreadyRewritten,
+			newServerURL: "https://aegis-server-1.aegis:6443",
+			wantContains: "https://aegis-server-1.aegis:6443",
+			wantAbsent:   "https://127.0.0.1:6443",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := rewriteKubeconfigServer(tt.in, tt.newServerURL)
+
+			if !bytes.Contains(got, []byte(tt.wantContains)) {
+				t.Errorf("want %q in output\ngot: %s", tt.wantContains, got)
+			}
+
+			if bytes.Contains(got, []byte(tt.wantAbsent)) {
+				t.Errorf("must not contain %q in output\ngot: %s", tt.wantAbsent, got)
+			}
+		})
 	}
 }
 

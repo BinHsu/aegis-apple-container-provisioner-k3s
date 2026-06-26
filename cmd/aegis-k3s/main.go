@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"path/filepath"
 
 	"github.com/BinHsu/aegis-apple-container-provisioner-k3s/provider/apple"
 )
@@ -116,29 +117,21 @@ func reportProvisioned(state apple.ClusterState, dnsDomain string) {
 	}
 
 	fmt.Printf("\nserver URL: %s\n", state.ServerURL)
+
+	// The provisioner wrote a ready-to-use kubeconfig during create (server URL already
+	// rewritten from 127.0.0.1 to the FQDN/IP). Point the operator straight at it.
+	kubeconfigPath := filepath.Join(state.StateDir, state.ClusterName, "kubeconfig")
+
 	fmt.Println("\nnext steps (operator):")
+	fmt.Println("  # The provisioner wrote a ready-to-use kubeconfig (server URL already rewritten):")
+	fmt.Printf("  export KUBECONFIG=%s\n", kubeconfigPath)
+	fmt.Println("  kubectl get nodes")
 
 	if dnsDomain != "" {
-		// FQDN mode: n.ID for the server holds the FQDN container name.
-		serverFQDN := ""
-		for _, n := range state.Nodes {
-			if n.Role == apple.RoleServer {
-				serverFQDN = n.ID // e.g. "aegis-server-1.aegis"
-				break
-			}
-		}
-
-		fmt.Println("  # fetch kubeconfig from the server node:")
-		fmt.Printf("  container exec %s cat /etc/rancher/k3s/k3s.yaml > kubeconfig\n", serverFQDN)
-		fmt.Println("  # Note: if container exec mangles the entrypoint args (G1 finding), see")
-		fmt.Println("  # docs/VERIFICATION.md — an alternative is mounting the named volume on a")
-		fmt.Println("  # scratch container to read the file.")
-		fmt.Printf("  # Rewrite kubeconfig server: https://127.0.0.1:6443 → https://%s:6443\n", serverFQDN)
-		fmt.Println("  # (valid: --tls-san covers the FQDN; FQDN survives cold-restart IP changes)")
+		fmt.Println("  # The kubeconfig points at the FQDN endpoint — it survives cold-restart IP changes.")
+		fmt.Println("  # (valid: --tls-san covered the FQDN when the API server cert was issued at create time)")
 	} else {
-		fmt.Printf("  container exec %s-server-1 cat /etc/rancher/k3s/k3s.yaml > kubeconfig\n", state.ClusterName)
-		fmt.Printf("  # rewrite kubeconfig server: field to %s\n", state.ServerURL)
+		fmt.Printf("  # IP-only mode: the endpoint is %s (current DHCP address).\n", state.ServerURL)
+		fmt.Println("  # Note: the IP may change after a cold restart (no FQDN in IP-only mode).")
 	}
-
-	fmt.Printf("  KUBECONFIG=./kubeconfig kubectl get nodes\n")
 }

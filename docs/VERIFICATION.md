@@ -41,29 +41,43 @@ container exec k3sg1.aegis k3s kubectl get nodes
 
 ---
 
-## G4 — readiness probe: does `/readyz` answer (via in-node `k3s kubectl`) before the kubeconfig is host-fetchable? ⛔ NOT RUN
+## G4 — readiness probe: exec-based `/readyz` approach INVALIDATED; replaced by `container cp` ⛔ INVALIDATED 2026-06-26
 
-Run second: bring-up orchestration (Create) blocks on this probe before it joins agents, so
-confirm the probe is correct before testing multi-node behavior.
+**FINDING (2026-06-26, G1 hardware run):** `container exec <id> k3s kubectl get --raw
+/readyz` fails with `unknown command "kubectl" for "kubectl"`.
 
-- **Hypothesis:** rancher/k3s has NO systemd to query (the entrypoint runs `k3s` directly),
-  so readiness is polled from inside the node via `k3s kubectl get --raw /readyz` (returns
-  `ok`). The in-node `k3s kubectl` uses `/etc/rancher/k3s/k3s.yaml`, which already trusts the
-  local CA, so it answers `/readyz` before the host can fetch a working kubeconfig — making
-  exec the right gate, not an HTTPS GET from the host. (Note: `container exec` works for k3s
-  subcommands despite the entrypoint mangling — only arbitrary shell commands are affected.)
-- **Commands:**
+**Root cause:** k3s is a multi-call binary — `kubectl` and `crictl` are symlinks to the
+same `k3s` binary. The container entrypoint runs `k3s` directly; `container exec` prepends
+the entrypoint again, so the effective invocation becomes `k3s k3s kubectl ...`. The outer
+`k3s` does not recognize `kubectl` as a subcommand of itself when invoked that way. This
+means the exec-based readiness probe ALWAYS errors — the cluster comes up healthy but
+Create exits 1, every time.
+
+**Note:** the G1 observation that "`container exec` works for k3s subcommands" was incorrect.
+The earlier sysctl exec (`container exec <id> sysctl -w net.ipv4.ip_forward=1`) passes
+because `sysctl` is a separate system binary — not a k3s multi-call symlink.
+
+**Replacement (implemented 2026-06-26; see `create.go` `waitForReady`):**
+
+Poll `container cp <server-fqdn>:/etc/rancher/k3s/k3s.yaml <kubeconfigPath>` with 5-second
+backoff until it succeeds (overall timeout: 120s). k3s writes `k3s.yaml` only once the API
+server is fully initialized (CA issued, control-plane healthy), so a successful `cp` is a
+reliable "server is up" signal — equivalent to `/readyz` returning `ok`. As a bonus it
+simultaneously delivers the operator's kubeconfig; the provisioner rewrites the server URL
+from `https://127.0.0.1:6443` to the FQDN endpoint (or current IP in IP-only mode) and
+writes the result to `<stateDir>/<cluster>/kubeconfig`. No manual steps needed.
+
+- **Commands (verification with replacement approach):**
   ```sh
-  # from launch, time how long until /readyz first returns ok
-  until container exec <fqdn> k3s kubectl get --raw /readyz 2>/dev/null | grep -qx ok; do
-    sleep 2; done; echo "ready"
-  # compare: an HTTPS GET from the host (expected to need -k / fail early)
-  curl -ks "https://<node-ip>:6443/readyz"
+  # confirm the provisioner wrote a working kubeconfig:
+  export KUBECONFIG=_out/clusters/aegis/kubeconfig
+  kubectl get nodes
+  # optional secondary check via curl:
+  curl -ks https://aegis-server-1.aegis:6443/readyz
   ```
-- **Pass:** the in-node `k3s kubectl get --raw /readyz` returns exactly `ok`; the probe
-  goes green within the `readyTimeout` (120s) the code uses.
-- **Fail:** `/readyz` never returns `ok` or readiness takes longer than `readyTimeout`.
-- **On fail:** fix the probe (different endpoint, longer timeout) before anything else.
+- **Pass:** `kubectl get nodes` returns the server node as `Ready`; no manual kubeconfig
+  fetch or server-URL rewrite was needed.
+- **Fail:** kubeconfig is absent or still contains `127.0.0.1` — the rewrite step failed.
 
 ---
 
