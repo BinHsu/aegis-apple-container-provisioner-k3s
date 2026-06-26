@@ -60,14 +60,12 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		return ClusterState{}, fmt.Errorf("ensuring network: %w", err)
 	}
 
-	// Pre-create every node's datastore bind-mount dir on the host. apple/container's
-	// --volume needs the host path to exist (UNVERIFIED whether it auto-creates; we
-	// create it to be safe — gate G3).
-	for _, node := range cfg.Nodes {
-		dir := nodeDatastoreHostPath(cfg, node)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return ClusterState{}, fmt.Errorf("creating datastore dir %q: %w", dir, err)
-		}
+	// Create each node's datastore bind-mount dir on the host, and refuse to boot onto
+	// stale state from a prior run (see prepareNodeDatastores). apple/container's --volume
+	// needs the host path to exist (UNVERIFIED whether it auto-creates; we create it to be
+	// safe — gate G3).
+	if err := prepareNodeDatastores(cfg); err != nil {
+		return ClusterState{}, err
 	}
 
 	server, agents := splitRoles(cfg.Nodes)
@@ -248,6 +246,55 @@ func validateClusterConfig(cfg ClusterConfig) error {
 	}
 
 	return nil
+}
+
+// prepareNodeDatastores creates the host bind-mount directory for each node's persistent
+// datastore (/var/lib/rancher/k3s), and guards against booting onto stale state.
+//
+// The guard is the load-bearing consequence of using a persistent host bind-mount instead
+// of tmpfs: a datastore dir left non-empty by a prior run carries an old sqlite database
+// (server) or old kubelet/agent state. Reusing either silently would resurrect a stale,
+// half-broken cluster (wrong certs, divergent state) rather than boot a clean one. We
+// refuse and tell the operator to destroy first — never silently reuse (surprise stale
+// boot) and never silently wipe. This mirrors the Talos sibling's prepareNodeVolumes.
+func prepareNodeDatastores(cfg ClusterConfig) error {
+	for _, node := range cfg.Nodes {
+		dir := nodeDatastoreHostPath(cfg, node)
+
+		empty, err := dirIsEmpty(dir)
+		if err != nil {
+			return fmt.Errorf("checking datastore dir %q for node %q: %w", dir, node.Name, err)
+		}
+
+		if !empty {
+			return fmt.Errorf(
+				"node %q: datastore dir %q already exists and is not empty (stale state from a prior run); "+
+					"run destroy for this cluster first — refusing to reuse or wipe it",
+				node.Name, dir,
+			)
+		}
+
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("creating datastore dir %q for node %q: %w", dir, node.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// dirIsEmpty reports whether dir is empty. A not-yet-existing dir counts as empty (nothing
+// stale). Carried over verbatim from the Talos sibling.
+func dirIsEmpty(dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+
+		return false, err
+	}
+
+	return len(entries) == 0, nil
 }
 
 // assertDistinctIPs fails if any two nodes share an IP (everyday-correctness regression

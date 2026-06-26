@@ -8,6 +8,15 @@ A standalone launcher that boots k3s clusters as Apple Silicon micro-VMs via App
 > been executed.** Every launch-recipe and lifecycle assumption is a hypothesis until the
 > G-gates in [`docs/VERIFICATION.md`](docs/VERIFICATION.md) are run. Search the tree for
 > `UNVERIFIED` and `PLACEHOLDER` to find every such assumption. Do not build anything on it.
+>
+> **G1 is the make-or-break gate.** Does k3s's embedded containerd start under Apple
+> `vminitd` with `--cap-add ALL`? If not, the whole approach is dead — run G1 before any
+> other gate (the kiac spike chose kubeadm + `kindest/node` over k3s, possibly for exactly
+> this reason).
+>
+> **VM verification is serialized after the Talos sibling.** Both spikes run on a single
+> MacBook Air, and Apple `container` boots one VM front at a time, so the two cannot run
+> concurrently. The Talos on-hardware pass runs first; this k3s runbook is queued behind it.
 
 ## What it is (and isn't)
 
@@ -45,8 +54,14 @@ key recipe deltas from Talos:
 waitForIPv4 → exec sysctl ip_forward=1 → poll /readyz via in-node k3s kubectl →
 run each AGENT (K3S_URL + K3S_TOKEN) → waitForIPv4 → exec sysctl → saveState`.
 
-`destroy`: stop + rm each node → delete network → **remove the host state dir**. Removing
-the bind-mounted datastore dir is what makes destroy *clean* vs. leaving it for a restart.
+Create also **refuses to boot onto stale state**: if a node's datastore dir is left non-empty
+by a prior run, it fails and tells you to destroy first — never silently reusing an old
+sqlite datastore or wiping it (the persistent-bind-mount counterpart to the Talos sibling's
+stale-state guard).
+
+`destroy`: stop + rm each node → remove each node's host datastore dir → delete network →
+**remove the per-cluster host state tree**. Removing the bind-mounted datastore dir is what
+makes destroy *clean* vs. leaving it for a restart.
 
 ## Open risks (the G-gates — all UNVERIFIED)
 
@@ -73,6 +88,25 @@ go run ./cmd/aegis-k3s -name aegis -agents 1
 # tear it down (removes nodes, network, and the host datastore dir)
 go run ./cmd/aegis-k3s -name aegis -destroy
 ```
+
+## Local checks
+
+The repo ships a `Makefile` of local gates so a problem fails on the machine before it
+reaches CI (CI / branch protection here is deferred until G1 passes — see
+[`docs/VERIFICATION.md`](docs/VERIFICATION.md)).
+
+```sh
+make build      # go build ./...
+make vet        # go vet ./...
+make test       # go test ./...   (BVA recipe-lock + stale-state guard)
+make fmt        # fail if not gofmt-clean
+make secrets    # gitleaks secret scan (local half of the secret-scan defense)
+make check      # all of the above
+```
+
+`make secrets` runs `gitleaks detect --source . --redact --no-banner` and needs `gitleaks`
+on `PATH` (`brew install gitleaks`). Running it locally catches a committed secret before it
+hits CI — pre-empting the gitleaks/CI surprise the Talos sibling ran into.
 
 ## Requirements
 

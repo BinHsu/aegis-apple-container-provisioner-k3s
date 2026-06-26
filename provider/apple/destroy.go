@@ -38,14 +38,34 @@ func (p *provisioner) Destroy(ctx context.Context, state ClusterState, logw io.W
 		if err := p.remove(ctx, node.ID); err != nil {
 			errs = append(errs, err)
 		}
+
+		// Remove the node's persistent datastore host dir (and its per-node parent). The
+		// per-cluster sweep below would also cover it, but the explicit per-node removal
+		// makes the intent unmistakable and keeps cleanup correct even if the host layout
+		// ever moves out from under <stateDir>/<name> — mirrors the Talos sibling. The
+		// node config carries no Memory/CPU here, but nodeDatastoreHostPath only needs the
+		// node Name, so reconstruct a minimal NodeConfig from saved state.
+		if state.StateDir != "" && state.ClusterName != "" {
+			datastoreDir := nodeDatastoreHostPath(
+				ClusterConfig{Name: state.ClusterName, StateDir: state.StateDir},
+				NodeConfig{Name: node.Name},
+			)
+
+			for _, dir := range []string{datastoreDir, filepath.Dir(datastoreDir)} {
+				if err := os.RemoveAll(dir); err != nil {
+					errs = append(errs, fmt.Errorf("removing datastore dir %q: %w", dir, err))
+				}
+			}
+		}
 	}
 
 	if err := p.destroyNetwork(ctx, state.Network); err != nil {
 		errs = append(errs, err)
 	}
 
-	// Remove the host state tree, including the bind-mounted datastore dirs. This is the
-	// step that makes destroy truly clean vs. leaving state for a restart (see doc above).
+	// Per-cluster sweep: removes state.json and the per-node datastore parent tree. This
+	// is the step that makes destroy truly clean vs. leaving state for a restart (see the
+	// doc comment above).
 	if state.StateDir != "" && state.ClusterName != "" {
 		clusterDir := filepath.Join(state.StateDir, state.ClusterName)
 		if err := os.RemoveAll(clusterDir); err != nil {

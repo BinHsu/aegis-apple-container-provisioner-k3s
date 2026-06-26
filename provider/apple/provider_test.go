@@ -4,6 +4,8 @@ package apple
 
 import (
 	"net/netip"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -151,6 +153,104 @@ func TestBuildRunArgs_AgentRecipe(t *testing.T) {
 			t.Errorf("agent recipe check failed: %s\nargs: %s", c.desc, joined)
 		}
 	}
+}
+
+// TestNodeDatastoreHostPath_Derivation locks the host-path scheme:
+// <stateDir>/<clusterName>/<nodeName>/k3s. The exact string is load-bearing — Create
+// mkdir's it, buildRunArgs bind-mounts it, and Destroy removes it, so a drift here would
+// silently break either the mount or the cleanup.
+func TestNodeDatastoreHostPath_Derivation(t *testing.T) {
+	cfg := ClusterConfig{Name: "aegis", StateDir: filepath.Join("_out", "clusters")}
+
+	got := nodeDatastoreHostPath(cfg, NodeConfig{Name: "aegis-server-1"})
+	want := filepath.Join("_out", "clusters", "aegis", "aegis-server-1", "k3s")
+
+	if got != want {
+		t.Errorf("datastore host dir: got %q, want %q", got, want)
+	}
+}
+
+// TestDatastorePath_CreateDestroySymmetry proves the dir buildRunArgs bind-mounts is
+// exactly the dir Destroy would remove — both derive from nodeDatastoreHostPath, so cleanup
+// can never target a different (or empty) directory than the one Create populated.
+func TestDatastorePath_CreateDestroySymmetry(t *testing.T) {
+	cfg := ClusterConfig{Name: "aegis", StateDir: filepath.Join("_out", "clusters")}
+	node := NodeConfig{Name: "aegis-agent-1", Role: RoleAgent}
+
+	args := buildRunArgs(cfg, node, "https://192.168.64.20:6443")
+
+	var mountedHost string
+
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--volume" {
+			host, target, _ := strings.Cut(args[i+1], ":")
+			if target == k3sDatastoreMount {
+				mountedHost = host
+			}
+		}
+	}
+
+	want := nodeDatastoreHostPath(cfg, node)
+	if mountedHost != want {
+		t.Errorf("datastore: mounted %q but destroy targets %q", mountedHost, want)
+	}
+}
+
+// TestPrepareNodeDatastores_StaleStateGuard is the BVA on the "is the datastore dir empty?"
+// boundary (CLAUDE.md k). B = 0 entries. B-1 (dir absent) and B (present, empty) must pass
+// and create the dir; B+1 (>= 1 entry, stale state) must be rejected so we never boot onto
+// an old sqlite datastore.
+func TestPrepareNodeDatastores_StaleStateGuard(t *testing.T) {
+	cfgFor := func(stateDir string) ClusterConfig {
+		return ClusterConfig{
+			Name:     "aegis",
+			StateDir: stateDir,
+			Nodes:    []NodeConfig{{Name: "aegis-server-1", Role: RoleServer}},
+		}
+	}
+
+	t.Run("absent dir (B-1): allowed, dir created", func(t *testing.T) {
+		cfg := cfgFor(t.TempDir()) // node dir does not exist yet
+
+		if err := prepareNodeDatastores(cfg); err != nil {
+			t.Fatalf("absent datastore dir must be allowed: %v", err)
+		}
+
+		dir := nodeDatastoreHostPath(cfg, cfg.Nodes[0])
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("expected %q created: %v", dir, err)
+		}
+	})
+
+	t.Run("present empty dir (B): allowed", func(t *testing.T) {
+		cfg := cfgFor(t.TempDir())
+		dir := nodeDatastoreHostPath(cfg, cfg.Nodes[0])
+
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := prepareNodeDatastores(cfg); err != nil {
+			t.Fatalf("present-but-empty datastore dir must be allowed: %v", err)
+		}
+	})
+
+	t.Run("non-empty dir (B+1): rejected", func(t *testing.T) {
+		cfg := cfgFor(t.TempDir())
+		dir := nodeDatastoreHostPath(cfg, cfg.Nodes[0])
+
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.WriteFile(filepath.Join(dir, "state.db"), []byte("stale"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := prepareNodeDatastores(cfg); err == nil {
+			t.Error("non-empty (stale) datastore dir must be rejected, telling the operator to destroy first")
+		}
+	})
 }
 
 // --- helpers ---
