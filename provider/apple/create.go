@@ -220,6 +220,12 @@ func (p *provisioner) enableIPForward(ctx context.Context, id string) error {
 // readyTimeout bounds how long we wait for the k3s server to initialize.
 const readyTimeout = 120 * time.Second
 
+// cpAttemptTimeout bounds a single `container cp` readiness probe so a wedged container daemon
+// (e.g. under extreme host memory pressure) cannot hang the readiness loop forever — the attempt
+// is killed via its context and retried until readyTimeout. (Origin 2026-06-26: a cp wedged ~4h
+// with no per-call bound, holding the VM's RAM and a stuck daemon.)
+const cpAttemptTimeout = 15 * time.Second
+
 // waitForReady polls until the k3s server has written /etc/rancher/k3s/k3s.yaml. k3s
 // only creates this file once the API server is fully initialized (CA issued,
 // control-plane healthy), so a successful `container cp` is a reliable "server is up"
@@ -235,7 +241,11 @@ func (p *provisioner) waitForReady(ctx context.Context, id, kubeconfigPath strin
 	src := id + ":/etc/rancher/k3s/k3s.yaml"
 
 	for {
-		if err := p.containerCP(ctx, src, kubeconfigPath); err == nil {
+		attemptCtx, cancel := context.WithTimeout(ctx, cpAttemptTimeout)
+		err := p.containerCP(attemptCtx, src, kubeconfigPath)
+		cancel()
+
+		if err == nil {
 			return nil
 		}
 
