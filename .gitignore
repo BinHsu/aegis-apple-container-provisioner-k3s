@@ -1,0 +1,11 @@
+# OS / editor noise
+.DS_Store
+**/.obsidian/
+.idea/
+.vscode/
+
+# build / state output
+/_out/
+/clusters/
+*.test
+kubeconfig
