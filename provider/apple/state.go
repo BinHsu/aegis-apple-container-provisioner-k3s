@@ -4,7 +4,9 @@ package apple
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -55,4 +57,32 @@ func LoadState(stateDir, clusterName string) (ClusterState, error) {
 	}
 
 	return state, nil
+}
+
+// ClusterRef builds a minimal ClusterState for a name-only, label-sweep teardown. It
+// carries just the cluster name and state dir, so Destroy's recorded-node pass is a no-op
+// (no Nodes) and the label sweep (k3s.cluster.name=<name>) reclaims any orphaned
+// containers/volumes by label alone. Mirrors the Talos sibling's apple.ClusterRef.
+func ClusterRef(clusterName, stateDir string) ClusterState {
+	return ClusterState{ClusterName: clusterName, StateDir: stateDir}
+}
+
+// LoadStateForDestroy loads a cluster's saved state for teardown, tolerating a missing
+// state.json. A Create that fails before saveState (e.g. the readiness probe timing out)
+// leaves running containers + named volumes but no state.json; aborting here would orphan
+// them. When state.json does not exist, this returns a name-only ClusterRef and
+// sweptByLabel=true so Destroy falls back to the label sweep. Any other read/parse error
+// (a real I/O fault, a corrupt file) still surfaces — only fs.ErrNotExist is tolerated.
+// Mirrors the Talos sibling's runDestroy fs.ErrNotExist handling.
+func LoadStateForDestroy(stateDir, clusterName string) (state ClusterState, sweptByLabel bool, err error) {
+	state, err = LoadState(stateDir, clusterName)
+
+	switch {
+	case err == nil:
+		return state, false, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return ClusterRef(clusterName, stateDir), true, nil
+	default:
+		return ClusterState{}, false, err
+	}
 }

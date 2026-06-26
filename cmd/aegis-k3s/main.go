@@ -53,9 +53,18 @@ func run() error {
 	defer prov.Close() //nolint:errcheck
 
 	if *destroy {
-		state, err := apple.LoadState(*stateDir, *clusterName)
+		// Tolerate a missing state.json: a Create that failed before saveState (e.g. the
+		// old readiness-probe timeout) leaves a running container + named volume but no
+		// state.json. Aborting here would orphan them. LoadStateForDestroy falls back to a
+		// name-only ClusterRef so Destroy reclaims them via the label sweep
+		// (k3s.cluster.name=<name>); other (non-not-exist) load errors still surface.
+		state, sweptByLabel, err := apple.LoadStateForDestroy(*stateDir, *clusterName)
 		if err != nil {
 			return fmt.Errorf("loading state for cluster %q: %w", *clusterName, err)
+		}
+
+		if sweptByLabel {
+			fmt.Printf("no state.json for cluster %q; sweeping by label k3s.cluster.name=%s\n", *clusterName, *clusterName)
 		}
 
 		if err := prov.Destroy(ctx, state, log.Writer()); err != nil {

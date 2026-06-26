@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -458,6 +460,86 @@ func TestRewriteKubeconfigServer(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLoadStateForDestroy is the BVA on the "is state.json loadable?" boundary
+// (CLAUDE.md k), the seam behind BUG #2 (a -destroy with no state.json must NOT abort
+// and orphan the running container + named volume):
+//   - missing state.json (the failed-create case): fall back to a name-only ClusterRef
+//     with sweptByLabel=true, so Destroy reclaims orphans via the label sweep.
+//   - present + valid state.json: return the loaded state, sweptByLabel=false.
+//   - present + corrupt state.json: a parse error must SURFACE (only fs.ErrNotExist is
+//     tolerated) — never silently treated as "missing".
+func TestLoadStateForDestroy(t *testing.T) {
+	t.Run("missing state.json: falls back to label-sweep ClusterRef", func(t *testing.T) {
+		dir := t.TempDir()
+
+		state, swept, err := LoadStateForDestroy(dir, "k3v")
+		if err != nil {
+			t.Fatalf("missing state.json must not error (would orphan resources): %v", err)
+		}
+
+		if !swept {
+			t.Error("missing state.json must report sweptByLabel=true")
+		}
+
+		if state.ClusterName != "k3v" || state.StateDir != dir {
+			t.Errorf("ClusterRef must carry name+stateDir for the label sweep, got %+v", state)
+		}
+
+		if len(state.Nodes) != 0 {
+			t.Errorf("ClusterRef must have no recorded nodes (recorded pass is a no-op), got %d", len(state.Nodes))
+		}
+	})
+
+	t.Run("present state.json: returns loaded state, no sweep flag", func(t *testing.T) {
+		dir := t.TempDir()
+		want := ClusterState{
+			Provisioner: ProviderName,
+			ClusterName: "k3v",
+			StateDir:    dir,
+			ServerURL:   "https://k3v-server-1.aegis:6443",
+		}
+
+		if err := saveState(want); err != nil {
+			t.Fatalf("saveState: %v", err)
+		}
+
+		state, swept, err := LoadStateForDestroy(dir, "k3v")
+		if err != nil {
+			t.Fatalf("present state.json must not error: %v", err)
+		}
+
+		if swept {
+			t.Error("present state.json must report sweptByLabel=false")
+		}
+
+		if state.ServerURL != want.ServerURL {
+			t.Errorf("loaded state mismatch: got %q want %q", state.ServerURL, want.ServerURL)
+		}
+	})
+
+	t.Run("corrupt state.json: parse error surfaces (not treated as missing)", func(t *testing.T) {
+		dir := t.TempDir()
+		clusterDir := filepath.Join(dir, "k3v")
+
+		if err := os.MkdirAll(clusterDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.WriteFile(filepath.Join(clusterDir, "state.json"), []byte("{not json"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		_, swept, err := LoadStateForDestroy(dir, "k3v")
+		if err == nil {
+			t.Error("corrupt state.json must surface an error, not be tolerated")
+		}
+
+		if swept {
+			t.Error("a parse error must NOT be treated as missing-state (sweptByLabel must be false)")
+		}
+	})
 }
 
 // --- helpers ---
