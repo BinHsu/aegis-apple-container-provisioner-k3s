@@ -51,22 +51,19 @@ type ClusterConfig struct {
 	Image string
 	// Network is the apple/container network name ("" or "default" = built-in).
 	Network string
-	// StateDir is the host directory under which per-node datastore bind-mounts and
-	// the saved state.json live.
+	// StateDir is the host directory under which state.json lives. Named volumes (not
+	// host directories) back the per-node k3s datastore — see node.go nodeVolumeName.
 	StateDir string
 	// Token is the shared K3S_TOKEN. Generated with crypto/rand if empty (see token.go).
 	Token string
-	// ClusterDNS is the stable name added as a --tls-san so the API server cert stays
-	// valid across vmnet IP changes (e.g. "aegis-k3s.local").
-	ClusterDNS string
-	// Nodes are the nodes to launch (server(s) first is enforced by Create's ordering).
+	// Nodes are the nodes to launch (server first is enforced by Create's ordering).
 	Nodes []NodeConfig
 }
 
 // NodeInfo is a launched node's discovered state.
 type NodeInfo struct {
-	ID   string       `json:"id"`
-	Name string       `json:"name"`
+	ID   string       `json:"id"`   // container name (FQDN when dns-domain is set)
+	Name string       `json:"name"` // bare node name; used for volume naming in Destroy
 	Role Role         `json:"role"`
 	IPs  []netip.Addr `json:"ips"`
 }
@@ -80,6 +77,6 @@ type ClusterState struct {
 	Network     string     `json:"network"`
 	Token       string     `json:"token"`
 	StateDir    string     `json:"stateDir"`
-	ServerURL   string     `json:"serverURL"` // https://<server-ip>:6443
+	ServerURL   string     `json:"serverURL"` // https://<server-fqdn>:6443 (FQDN or IP)
 	Nodes       []NodeInfo `json:"nodes"`
 }

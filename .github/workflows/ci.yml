@@ -1,0 +1,60 @@
+# CI for the apple-container provider module. Build + vet + the BVA unit tests + govulncheck +
+# secret scan. The empirical integration (container run rancher/k3s ...) needs macOS +
+# Apple's container runtime (Virtualization.framework) and cannot run on hosted Linux runners, so
+# it stays a documented manual step (docs/VERIFICATION.md G2/G3/G5); CI verifies everything else.
+#
+# Actions are pinned to major version tags here; SHA-pinning (supply-chain gate)
+# is the next hardening step — apply with a tool such as `pinact` rather than hand-copied SHAs.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4" # >= 1.26.4 closes GO-2026-5037 / GO-2026-5039 (stdlib)
+          cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -race
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+      # Run golangci-lint v2 via `go run` (matches .golangci.yml's v2 schema, lefthook, and the
+      # local verification). golangci-lint-action@v6 installs golangci-lint v1, which cannot parse
+      # a v2 config; pinning the version here avoids that action<->lint major-version coupling.
+      - run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run ./...
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

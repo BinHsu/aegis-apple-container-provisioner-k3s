@@ -1,0 +1,22 @@
+# Traefik ingress for the nginx Service (k3s ships Traefik by default).
+# Used by docs/VERIFICATION.md G6 (host-side ingress routing).
+# Apply with: kubectl apply -f examples/ingress.yaml
+# Then from the host:  curl http://<node-ip>:80 -H 'Host: demo.local'   -> HTTP 200
+#                      curl http://<node-ip>:80 -H 'Host: nope.local'   -> HTTP 404
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: demo.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nginx
+                port:
+                  number: 80
