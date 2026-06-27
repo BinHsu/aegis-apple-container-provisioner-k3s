@@ -220,7 +220,7 @@ func (p *provisioner) drainNode(ctx context.Context, stateDir, clusterName, node
 func nextAgentIndex(nodes []NodeInfo, clusterName string) int {
 	prefix := clusterName + "-agent-"
 
-	max := 0
+	highest := 0
 
 	for _, n := range nodes {
 		suffix, ok := strings.CutPrefix(n.Name, prefix)
@@ -233,12 +233,12 @@ func nextAgentIndex(nodes []NodeInfo, clusterName string) int {
 			continue // non-numeric suffix: not one of our generated agent names
 		}
 
-		if idx > max {
-			max = idx
+		if idx > highest {
+			highest = idx
 		}
 	}
 
-	return max + 1
+	return highest + 1
 }
 
 // ensureRemovable is the server-removal guard, extracted from RemoveNode so the decision
