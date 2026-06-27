@@ -80,7 +80,14 @@ func (p *provisioner) destroyRecordedNodes(ctx context.Context, state ClusterSta
 			errs = append(errs, err)
 		}
 
+		// The managed datastore node uses its own volume scheme (<cluster>-db-pg) and mount,
+		// not the k3s nodeVolumeName scheme — pick the right name by role so this pass deletes
+		// it explicitly rather than relying on the label sweep alone.
 		vol := nodeVolumeName(state.ClusterName, node.Name)
+		if node.Role == RoleDatastore {
+			vol = datastoreVolumeName(state.ClusterName)
+		}
+
 		if err := p.volumeDelete(ctx, vol); err != nil {
 			errs = append(errs, err)
 		}

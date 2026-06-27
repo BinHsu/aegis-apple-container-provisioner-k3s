@@ -23,10 +23,11 @@ import (
 //
 //	validate -> ensureNetwork -> DNS domain precheck
 //	  -> prepareNodeVolumes (create named volumes, stale-state guard)
-//	  -> launch SERVER (sqlite, host-gw, tls-san, K3S_TOKEN preset)
-//	  -> waitForIPv4(server) -> exec sysctl ip_forward=1
-//	  -> poll k3s.yaml via container cp (readiness signal + kubeconfig delivery)
+//	  -> launch BOOTSTRAP server (host-gw, tls-san, K3S_TOKEN preset, kubeconfig bind-mount;
+//	     embedded sqlite OR --datastore-endpoint when HA)
+//	  -> waitForIPv4 -> exec sysctl ip_forward=1 -> waitForReady (TLS dial + kubeconfig file)
 //	  -> rewrite kubeconfig server URL -> save to <stateDir>/<cluster>/kubeconfig
+//	  -> launchJoinServers (HA only): each additional server joins the SHARED datastore
 //	  -> for each AGENT: launch (K3S_URL=FQDN + K3S_TOKEN) -> waitForIPv4 -> exec sysctl
 //	  -> assertDistinctIPs -> saveState
 //
@@ -71,6 +72,16 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		}
 	}
 
+	// Managed datastore (HA): provision a Postgres micro-VM and wire its --datastore-endpoint
+	// BEFORE any server launches. A bring-your-own DatastoreEndpoint skips this. Extracted to
+	// setupDatastore to keep Create readable.
+	datastoreInfo, endpoint, err := p.setupDatastore(ctx, cfg, logw)
+	if err != nil {
+		return ClusterState{}, err
+	}
+
+	cfg.DatastoreEndpoint = endpoint
+
 	// Create each node's k3s datastore named volume before launch, and refuse to boot
 	// onto stale state from a prior run (see prepareNodeVolumes). Volumes are stamped
 	// with the cluster labels so the destroy label sweep can reclaim them even if this
@@ -83,7 +94,8 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		return ClusterState{}, err
 	}
 
-	server, agents := splitRoles(cfg.Nodes)
+	servers, agents := splitRoles(cfg.Nodes)
+	server := servers[0] // bootstrap server: launched first, delivers the kubeconfig
 
 	// The kubeconfig is delivered via a host BIND-MOUNT, not container cp. k3s writes its
 	// admin kubeconfig into the bind-mounted cluster state dir (--write-kubeconfig), and we
@@ -121,39 +133,23 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		return ClusterState{}, fmt.Errorf("server %q: %w", server.Name, err)
 	}
 
-	// 3) Wait for the k3s API server to answer on the network, then read the kubeconfig that
-	// k3s has written to the bind-mounted host dir. No container cp — see the note above.
-	kubeconfigSrc := filepath.Join(clusterDir, kubeconfigFileName) // written by k3s via the mount
-	kubeconfigPath := filepath.Join(clusterDir, "kubeconfig")      // operator copy, endpoint rewritten
-
-	fmt.Fprintln(logw, "waiting for k3s API server on the network")
-
-	if err := p.waitForReady(ctx, serverIP, kubeconfigSrc); err != nil {
-		return ClusterState{}, fmt.Errorf("server %q readiness: %w", server.Name, err)
-	}
-
-	// 4) Compute the server URL, then rewrite the kubeconfig's loopback server address.
-	// k3s always writes https://127.0.0.1:6443; rewrite to the FQDN (stable across
-	// cold-restart IP changes when dns-domain is set) or the current DHCP IP otherwise.
-	var serverURL string
-	if p.dnsDomain != "" {
-		serverURL = "https://" + net.JoinHostPort(nodeFQDN(server.Name, p.dnsDomain), strconv.Itoa(k3sAPIPort))
-	} else {
-		serverURL = "https://" + net.JoinHostPort(serverIP.String(), strconv.Itoa(k3sAPIPort))
-	}
-
-	raw, err := os.ReadFile(kubeconfigSrc)
+	// 3+4) Gate on the bootstrap API server, then deliver the kubeconfig (loopback rewritten to
+	// the FQDN/IP endpoint). Extracted to deliverKubeconfig to keep Create readable.
+	serverURL, err := p.deliverKubeconfig(ctx, server, serverIP, clusterDir, logw)
 	if err != nil {
-		return ClusterState{}, fmt.Errorf("reading kubeconfig written by k3s at %q: %w", kubeconfigSrc, err)
+		return ClusterState{}, err
 	}
-
-	if err := os.WriteFile(kubeconfigPath, rewriteKubeconfigServer(raw, serverURL), 0o600); err != nil {
-		return ClusterState{}, fmt.Errorf("writing kubeconfig %q: %w", kubeconfigPath, err)
-	}
-
-	fmt.Fprintf(logw, "kubeconfig saved to %s\n", kubeconfigPath)
 
 	nodes := []NodeInfo{serverInfo}
+
+	// 4.5) Launch ADDITIONAL servers for HA (servers[1:]). Extracted to keep Create readable;
+	// see launchJoinServers for why these join with no kubeconfig mount and no --cluster-init.
+	joinInfos, err := p.launchJoinServers(ctx, cfg, servers[1:], logw)
+	if err != nil {
+		return ClusterState{}, err
+	}
+
+	nodes = append(nodes, joinInfos...)
 
 	// 5) Launch AGENT nodes pointed at the server.
 	for _, agent := range agents {
@@ -171,20 +167,30 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		nodes = append(nodes, info)
 	}
 
+	// Record the managed datastore node (if any) FIRST in state, so teardown and reporting
+	// see it. It is not a k3s node — it carries no kubeconfig and joins no cluster — but it
+	// is real infrastructure to reclaim, so it rides ClusterState.Nodes with RoleDatastore.
+	if datastoreInfo != nil {
+		nodes = append([]NodeInfo{*datastoreInfo}, nodes...)
+	}
+
 	// Everyday-correctness guard carried over from the Talos sibling: every node must
-	// get a distinct vmnet IP, else the cluster silently breaks.
+	// get a distinct vmnet IP, else the cluster silently breaks. The datastore VM is
+	// included — its IP must differ from every k3s node too.
 	if err := assertDistinctIPs(nodes); err != nil {
 		return ClusterState{}, err
 	}
 
 	state := ClusterState{
-		Provisioner: ProviderName,
-		ClusterName: cfg.Name,
-		Network:     cfg.Network,
-		Token:       cfg.Token,
-		StateDir:    cfg.StateDir,
-		ServerURL:   serverURL,
-		Nodes:       nodes,
+		Provisioner:       ProviderName,
+		ClusterName:       cfg.Name,
+		Network:           cfg.Network,
+		Token:             cfg.Token,
+		StateDir:          cfg.StateDir,
+		Image:             cfg.Image, // resolved (empty->defaultK3sImage above); AddAgents reuses it
+		DatastoreEndpoint: cfg.DatastoreEndpoint,
+		ServerURL:         serverURL,
+		Nodes:             nodes,
 	}
 
 	if err := saveState(state); err != nil {
@@ -192,6 +198,43 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 	}
 
 	return state, nil
+}
+
+// deliverKubeconfig gates on the bootstrap k3s API server becoming reachable, then reads the
+// admin kubeconfig k3s wrote to the bind-mounted host dir, rewrites its loopback server address
+// to the stable endpoint (the server FQDN when a DNS domain is set — survives cold-restart IP
+// changes — or the current DHCP IP otherwise), and writes the operator copy. No container cp:
+// readiness is a host-side TLS dial and the kubeconfig arrives via the host bind-mount (ADR-0001).
+// Returns the computed server URL (also used as the agents' K3S_URL).
+func (p *provisioner) deliverKubeconfig(ctx context.Context, server NodeConfig, serverIP netip.Addr, clusterDir string, logw io.Writer) (string, error) {
+	kubeconfigSrc := filepath.Join(clusterDir, kubeconfigFileName) // written by k3s via the mount
+	kubeconfigPath := filepath.Join(clusterDir, "kubeconfig")      // operator copy, endpoint rewritten
+
+	fmt.Fprintln(logw, "waiting for k3s API server on the network")
+
+	if err := p.waitForReady(ctx, serverIP, kubeconfigSrc); err != nil {
+		return "", fmt.Errorf("server %q readiness: %w", server.Name, err)
+	}
+
+	var serverURL string
+	if p.dnsDomain != "" {
+		serverURL = "https://" + net.JoinHostPort(nodeFQDN(server.Name, p.dnsDomain), strconv.Itoa(k3sAPIPort))
+	} else {
+		serverURL = "https://" + net.JoinHostPort(serverIP.String(), strconv.Itoa(k3sAPIPort))
+	}
+
+	raw, err := os.ReadFile(kubeconfigSrc)
+	if err != nil {
+		return "", fmt.Errorf("reading kubeconfig written by k3s at %q: %w", kubeconfigSrc, err)
+	}
+
+	if err := os.WriteFile(kubeconfigPath, rewriteKubeconfigServer(raw, serverURL), 0o600); err != nil {
+		return "", fmt.Errorf("writing kubeconfig %q: %w", kubeconfigPath, err)
+	}
+
+	fmt.Fprintf(logw, "kubeconfig saved to %s\n", kubeconfigPath)
+
+	return serverURL, nil
 }
 
 // launchNode runs one node and returns its NodeInfo once it has a vmnet IP.
@@ -219,6 +262,148 @@ func (p *provisioner) launchNode(ctx context.Context, cfg ClusterConfig, node No
 		Role: node.Role,
 		IPs:  []netip.Addr{addr},
 	}, nil
+}
+
+// launchJoinServers brings up the non-bootstrap HA servers (servers[1:]) and returns their
+// NodeInfo in launch order. validateClusterConfig has guaranteed an external datastore endpoint
+// is set whenever there is more than one server, so each joins simply by running `k3s server`
+// against the SAME shared datastore + token — no --cluster-init, no separate join step
+// (docs/ADR/0002). They get no kubeconfig mount (the bootstrap server already delivered it), so
+// readiness is the host-side TLS dial only (no kubeconfig-file wait). Returns the slice unchanged
+// (nil) when there are no additional servers — the single-server path.
+func (p *provisioner) launchJoinServers(ctx context.Context, cfg ClusterConfig, servers []NodeConfig, logw io.Writer) ([]NodeInfo, error) {
+	var infos []NodeInfo
+
+	for _, s := range servers {
+		fmt.Fprintln(logw, "launching k3s server", s.Name, "(HA, shared datastore)")
+
+		info, err := p.launchNode(ctx, cfg, s, "", "")
+		if err != nil {
+			return nil, err
+		}
+
+		if err := p.enableIPForward(ctx, info.ID); err != nil {
+			return nil, fmt.Errorf("server %q: %w", s.Name, err)
+		}
+
+		if err := p.waitForAPIServer(ctx, info.IPs[0]); err != nil {
+			return nil, fmt.Errorf("server %q readiness: %w", s.Name, err)
+		}
+
+		infos = append(infos, info)
+	}
+
+	return infos, nil
+}
+
+// setupDatastore provisions the managed Postgres datastore when one is requested, returning its
+// NodeInfo and the endpoint the servers should use. When no managed datastore is needed (single
+// server, or a bring-your-own endpoint already set) it returns (nil, cfg.DatastoreEndpoint, nil).
+// A managed datastore requires a DNS domain: the servers reach it by FQDN, which is what lets the
+// control plane survive the cold-restart IP shift that killed embedded etcd (docs/ADR/0002).
+func (p *provisioner) setupDatastore(ctx context.Context, cfg ClusterConfig, logw io.Writer) (*NodeInfo, string, error) {
+	if !cfg.ManageDatastore || cfg.DatastoreEndpoint != "" {
+		return nil, cfg.DatastoreEndpoint, nil
+	}
+
+	if p.dnsDomain == "" {
+		return nil, "", fmt.Errorf("cluster %q: a managed datastore (HA) requires a DNS domain for a stable "+
+			"endpoint; set -dns-domain (and run: sudo container system dns create <domain>)", cfg.Name)
+	}
+
+	info, endpoint, err := p.provisionDatastore(ctx, cfg, logw)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return &info, endpoint, nil
+}
+
+// provisionDatastore brings up the managed Postgres datastore micro-VM and returns its
+// NodeInfo plus the k3s --datastore-endpoint URL the servers should use. The data dir is a
+// named volume (labeled for the destroy sweep) with the PGDATA-subdir guard; readiness is a
+// host-side TCP dial to :5432 (Postgres opens that port only after initdb finishes). The
+// caller must have ensured p.dnsDomain != "" (the endpoint is FQDN-addressed so it survives
+// the cold-restart IP shift — docs/ADR/0002).
+func (p *provisioner) provisionDatastore(ctx context.Context, cfg ClusterConfig, logw io.Writer) (NodeInfo, string, error) {
+	name := datastoreNodeName(cfg.Name)
+	id := nodeFQDN(name, p.dnsDomain)
+
+	fmt.Fprintln(logw, "provisioning managed Postgres datastore", id)
+
+	password, err := generateDatastorePassword()
+	if err != nil {
+		return NodeInfo{}, "", err
+	}
+
+	// Stale-state guard, same discipline as prepareNodeVolumes: a leftover data volume from a
+	// prior run carries an old Postgres cluster; refuse rather than boot onto it.
+	vol := datastoreVolumeName(cfg.Name)
+
+	present, err := p.volumeExists(ctx, vol)
+	if err != nil {
+		return NodeInfo{}, "", fmt.Errorf("checking datastore volume %q: %w", vol, err)
+	}
+
+	if present {
+		return NodeInfo{}, "", fmt.Errorf("datastore volume %q already exists (stale state from a prior run); "+
+			"run -destroy for this cluster first — refusing to reuse it", vol)
+	}
+
+	if err := p.volumeCreate(ctx, vol, volumeLabels(cfg.Name)...); err != nil {
+		return NodeInfo{}, "", fmt.Errorf("creating datastore volume %q: %w", vol, err)
+	}
+
+	if _, err := p.run(ctx, buildDatastoreRunArgs(cfg, password, p.dnsDomain)...); err != nil {
+		return NodeInfo{}, "", fmt.Errorf("launching datastore %q: %w", id, err)
+	}
+
+	addr, err := p.waitForIPv4(ctx, id)
+	if err != nil {
+		return NodeInfo{}, "", err
+	}
+
+	if err := p.waitForDatastore(ctx, addr); err != nil {
+		return NodeInfo{}, "", fmt.Errorf("datastore %q readiness: %w", id, err)
+	}
+
+	info := NodeInfo{ID: id, Name: name, Role: RoleDatastore, IPs: []netip.Addr{addr}}
+
+	return info, datastoreEndpointURL(cfg.Name, p.dnsDomain, password), nil
+}
+
+// datastoreReadyTimeout bounds the wait for Postgres to accept TCP connections. The official
+// image runs initdb (and any init scripts) before it opens :5432 to the network, so a
+// successful dial is a sound readiness signal.
+const datastoreReadyTimeout = 120 * time.Second
+
+// waitForDatastore polls a plain TCP connect against <ip>:5432 until Postgres answers or the
+// timeout elapses. Unlike waitForAPIServer this is a bare TCP dial (no TLS): the readiness
+// signal is only that the port is open. The k3s servers do their own datastore auth afterward.
+func (p *provisioner) waitForDatastore(ctx context.Context, ip netip.Addr) error {
+	addr := net.JoinHostPort(ip.String(), strconv.Itoa(datastorePort))
+	deadline := time.Now().Add(datastoreReadyTimeout)
+	dialer := &net.Dialer{Timeout: apiDialTimeout}
+
+	var lastErr error
+	for {
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		lastErr = err
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("datastore at %s not reachable within %s: %w", addr, datastoreReadyTimeout, lastErr)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(apiPollInterval):
+		}
+	}
 }
 
 // enableIPForward sets net.ipv4.ip_forward=1 inside a node. Mandatory for k3s pod
@@ -333,28 +518,35 @@ func rewriteKubeconfigServer(in []byte, newServerURL string) []byte {
 	return bytes.ReplaceAll(in, []byte("https://127.0.0.1:6443"), []byte(newServerURL))
 }
 
-// splitRoles returns the single server node and the agent nodes. validateClusterConfig
-// has already guaranteed exactly one server, so indexing [0] of the servers is safe.
-func splitRoles(nodes []NodeConfig) (server NodeConfig, agents []NodeConfig) {
+// splitRoles partitions nodes into servers and agents, preserving order. servers[0] is the
+// bootstrap server (launched first, owns kubeconfig delivery); servers[1:] join the same
+// datastore. validateClusterConfig has already guaranteed len(servers) >= 1, so indexing
+// servers[0] in Create is safe.
+func splitRoles(nodes []NodeConfig) (servers, agents []NodeConfig) {
 	for _, n := range nodes {
 		if n.Role == RoleServer {
-			server = n
+			servers = append(servers, n)
 		} else {
 			agents = append(agents, n)
 		}
 	}
 
-	return server, agents
+	return servers, agents
 }
 
 // validateClusterConfig rejects requests that would break bring-up before launching
-// anything. The meaningful boundary (BVA, CLAUDE.md k) is the server count: this is a
-// sqlite single-server cluster, so exactly ONE server is required.
-//   - 0 servers  (B-1): rejected — nothing owns the datastore/API.
-//   - 1 server   (B)  : accepted — the single-server case k3s+sqlite supports.
-//   - 2+ servers (B+1): rejected — multi-server needs embedded etcd (--cluster-init),
-//     which we deliberately do NOT enable (see node.go: etcd's IP-bound membership does
-//     not survive the vmnet IP-change problem).
+// anything. The meaningful boundary (BVA, CLAUDE.md k) is the server count, and it is now
+// gated on the datastore mode:
+//   - 0 servers              : rejected — nothing owns the API.
+//   - 1 server               : accepted — embedded sqlite (v0.1.x) or external datastore.
+//   - 2+ servers, no endpoint: rejected — multi-server sqlite is impossible (sqlite is a
+//     local file; see docs/ADR/0002) and embedded etcd is deliberately disabled (its
+//     IP-bound peer membership cannot survive the vmnet DHCP IP shift).
+//   - 2+ servers, endpoint set: accepted — HA against the shared external datastore.
+//
+// So the boundary is B=1 ONLY when DatastoreEndpoint is empty; with an endpoint, any
+// servers>=1 is valid. Both sides of B+1 (2 servers) are exercised: rejected without an
+// endpoint, accepted with one.
 func validateClusterConfig(cfg ClusterConfig) error {
 	servers := 0
 
@@ -366,10 +558,12 @@ func validateClusterConfig(cfg ClusterConfig) error {
 
 	switch {
 	case servers == 0:
-		return fmt.Errorf("cluster %q: exactly one server node is required, got 0 (of %d nodes)",
+		return fmt.Errorf("cluster %q: at least one server node is required, got 0 (of %d nodes)",
 			cfg.Name, len(cfg.Nodes))
-	case servers > 1:
-		return fmt.Errorf("cluster %q: this is a sqlite single-server launcher; got %d servers (multi-server needs embedded etcd, which is intentionally disabled)",
+	case servers > 1 && cfg.DatastoreEndpoint == "" && !cfg.ManageDatastore:
+		return fmt.Errorf("cluster %q: %d servers require an external datastore "+
+			"(-datastore-endpoint, or let k3ac provision one); multi-server sqlite is impossible "+
+			"and embedded etcd is intentionally disabled (see docs/ADR/0002)",
 			cfg.Name, servers)
 	}
 

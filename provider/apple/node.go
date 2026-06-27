@@ -5,7 +5,9 @@ package apple
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,6 +26,19 @@ const k3sDatastoreMount = "/var/lib/rancher/k3s"
 
 // k3sAPIPort is the k3s API server / join port.
 const k3sAPIPort = 6443
+
+// Managed datastore (Postgres) recipe constants. The HA spike (VERIFICATION G9, docs/ADR/0002)
+// used exactly these. Image and memory are fixed defaults for now — tuning flags are a
+// deliberate follow-up, not part of this cut.
+const (
+	defaultDatastoreImage       = "postgres:17-alpine"
+	datastorePort               = 5432
+	datastoreUser               = "kine"
+	datastoreDB                 = "kine"
+	datastoreDataMount          = "/var/lib/postgresql/data"
+	datastorePGDataDir          = "/var/lib/postgresql/data/pgdata" // PGDATA subdir: an ext4 named volume ships a lost+found that blocks initdb at the mount root (G9)
+	defaultDatastoreMemoryBytes = 1024 * 1024 * 1024                // 1 GiB
+)
 
 // kubeconfigMount is the in-node mount point for a HOST bind-mount of the cluster state
 // dir on the server node. k3s writes its admin kubeconfig here (--write-kubeconfig
@@ -90,6 +105,71 @@ func nodeFQDN(nodeName, domain string) string {
 	}
 
 	return nodeName + "." + domain
+}
+
+// clusterAPIFQDN returns the shared HA API endpoint name <cluster>-api.<domain>. It is added
+// to every server's --tls-san in HA mode (see buildRunArgs) so a single kubeconfig endpoint
+// and a future API load balancer are cert-valid against any server. It is NOT a container
+// name, so container DNS does not auto-register it — wiring it as the live endpoint is the
+// load-balancer step deferred in docs/ADR/0002.
+func clusterAPIFQDN(clusterName, domain string) string {
+	return clusterName + "-api." + domain
+}
+
+// datastoreNodeName is the bare name of the managed datastore node: <cluster>-db. The FQDN
+// (datastoreNodeName + "." + domain) is both the container --name and the host that the
+// servers' --datastore-endpoint points at, so container DNS re-registers it to the new IP on
+// a cold restart (the property that makes external-datastore HA survive the DHCP shift, G9).
+func datastoreNodeName(clusterName string) string {
+	return clusterName + "-db"
+}
+
+// datastoreVolumeName is the named volume backing the managed Postgres data dir. It does NOT
+// follow the k3s nodeVolumeName scheme (that is <cluster>-<node>-k3s for /var/lib/rancher/k3s);
+// destroyRecordedNodes special-cases RoleDatastore to delete this name.
+func datastoreVolumeName(clusterName string) string {
+	return sanitizeVolumeName(clusterName + "-db-pg")
+}
+
+// datastoreEndpointURL builds the k3s --datastore-endpoint for the managed Postgres node.
+// sslmode=disable: the datastore is on the private vmnet and v0.2.0 does not provision TLS for
+// it (a documented limit in docs/ADR/0002; k3s supports --datastore-cafile/certfile/keyfile for
+// hardening later). The password is a generated hex string, URL-safe with no escaping needed.
+func datastoreEndpointURL(clusterName, domain, password string) string {
+	host := net.JoinHostPort(nodeFQDN(datastoreNodeName(clusterName), domain), strconv.Itoa(datastorePort))
+
+	return fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", datastoreUser, password, host, datastoreDB)
+}
+
+// buildDatastoreRunArgs assembles the `container run` vector for the managed Postgres datastore
+// micro-VM. Pure function (unit-testable without launching a VM), mirroring buildRunArgs. It is
+// deliberately NOT buildRunArgs: a Postgres node shares none of the k3s recipe (no --cap-add ALL,
+// no tmpfs, no k3s subcommand, a different image, env, data mount, and the PGDATA-subdir guard).
+// It carries the same cluster labels as k3s nodes so the destroy label sweep reclaims it.
+func buildDatastoreRunArgs(cfg ClusterConfig, password, dnsDomain string) []string {
+	args := []string{
+		"run", "--detach",
+		"--name", nodeFQDN(datastoreNodeName(cfg.Name), dnsDomain),
+		"--memory", fmt.Sprintf("%dMB", defaultDatastoreMemoryBytes/(1024*1024)),
+		"--volume", datastoreVolumeName(cfg.Name) + ":" + datastoreDataMount,
+		"--env", "POSTGRES_USER=" + datastoreUser,
+		"--env", "POSTGRES_PASSWORD=" + password,
+		"--env", "POSTGRES_DB=" + datastoreDB,
+		// PGDATA subdir: the ext4 named volume ships a lost+found, so initdb refuses the mount
+		// root as the data dir (G9). Point it at a subdirectory.
+		"--env", "PGDATA=" + datastorePGDataDir,
+		"--label", labelOwned + "=true",
+		"--label", labelClusterName + "=" + cfg.Name,
+		"--label", "k3s.role=" + RoleDatastore.String(),
+	}
+
+	if cfg.Network != "" {
+		args = append(args, "--network", cfg.Network)
+	}
+
+	args = append(args, defaultDatastoreImage)
+
+	return args
 }
 
 // nodeTmpfsPaths returns the in-VM paths mounted as writable tmpfs for a k3s node.
@@ -212,6 +292,15 @@ func buildRunArgs(cfg ClusterConfig, node NodeConfig, serverURL, dnsDomain, kube
 		// kernel dependency (the default flannel VXLAN backend needs br_netfilter).
 		args = append(args, "--flannel-backend=host-gw")
 
+		// HA DATASTORE: when an external datastore endpoint is configured, every server runs
+		// stateless against it — no embedded etcd, no --cluster-init (etcd's IP-bound peer
+		// membership cannot survive the vmnet DHCP IP shift; docs/ADR/0002). Single-server
+		// clusters leave this empty and use the embedded sqlite default, byte-identical to
+		// v0.1.x. validateClusterConfig guarantees an endpoint is present for >1 server.
+		if cfg.DatastoreEndpoint != "" {
+			args = append(args, "--datastore-endpoint="+cfg.DatastoreEndpoint)
+		}
+
 		// Write the admin kubeconfig to the bind-mounted host dir (mode 0644 so the host
 		// user can read it without a chmod round-trip) instead of the default in-node
 		// /etc/rancher/k3s/k3s.yaml that only container cp could reach. Create reads it
@@ -230,6 +319,15 @@ func buildRunArgs(cfg ClusterConfig, node NodeConfig, serverURL, dnsDomain, kube
 		// the IP-change limitation as documented in docs/VERIFICATION.md G5).
 		if dnsDomain != "" {
 			args = append(args, "--tls-san", nodeFQDN(node.Name, dnsDomain))
+
+			// HA: also cover the shared cluster API name so ONE kubeconfig endpoint (and a
+			// future API load balancer) is cert-valid against every server. Only added in HA
+			// mode; harmless extra SAN. The name is not auto-registered in container DNS, so
+			// until an LB/DNS record exists the kubeconfig still points at the bootstrap
+			// server's own FQDN — this SAN is forward-compatible cover for that work.
+			if cfg.DatastoreEndpoint != "" {
+				args = append(args, "--tls-san", clusterAPIFQDN(cfg.Name, dnsDomain))
+			}
 		}
 	}
 

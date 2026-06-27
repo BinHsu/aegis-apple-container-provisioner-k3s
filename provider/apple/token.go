@@ -24,3 +24,15 @@ func generateToken() (string, error) {
 
 	return hex.EncodeToString(b), nil
 }
+
+// generateDatastorePassword returns a cryptographically random password for the managed
+// Postgres datastore. Hex-encoded (URL-safe: no characters that need escaping inside the
+// postgres:// connection URL), same entropy as the K3S_TOKEN.
+func generateDatastorePassword() (string, error) {
+	b := make([]byte, tokenBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generating datastore password: %w", err)
+	}
+
+	return hex.EncodeToString(b), nil
+}

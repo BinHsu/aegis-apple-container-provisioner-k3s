@@ -21,6 +21,9 @@ Every gate below carries the concrete evidence from those runs; verdicts are not
 | G5 | FQDN endpoint survives cold restart when DHCP shifts the IP | ✅ PASS (2026-06-27) |
 | G6 | Real workload + k3s built-in Traefik ingress reachable from the host | ✅ PASS (2026-06-27) |
 | G7 | Full lifecycle teardown — no daemon hang, both `state.json` and label-sweep paths | ✅ PASS (2026-06-27) |
+| G8 | Node membership — add/remove agents on a running cluster (v0.2.0) | ✅ PASS (2026-06-27) |
+| G9 | HA external-datastore: 2 servers survive a cold-restart DHCP IP shift (v0.2.0 spike) | ✅ PASS (2026-06-27) |
+| G10 | k3ac one-command HA: `-servers 2` provisions managed Postgres + 2 servers; survives cold restart; clean teardown (v0.2.0) | ✅ PASS (2026-06-27) |
 
 ---
 
@@ -393,6 +396,125 @@ and it exited as cleanly as the normal path.
 
 **Verdict.** PASS. Both destroy paths — `state.json` and label-sweep fallback — exit cleanly
 in approximately 1 second with no daemon hang and no leftover resources.
+
+---
+
+## G8 — node membership: add / remove on a running cluster ✅ PASS 2026-06-27 (v0.2.0)
+
+**What I ran.** Provisioned `k3x` with one server + one agent (1536 MB each). Then exercised the
+membership operations against the running cluster:
+
+```sh
+go run ./cmd/k3ac -name k3x -add-agents 1 -agent-memory 1536 -dns-domain aegis      # add k3x-agent-2
+export KUBECONFIG=_out/clusters/k3x/kubeconfig
+kubectl wait --for=condition=Ready node/k3x-agent-2 --timeout=90s
+go run ./cmd/k3ac -name k3x -remove-node k3x-agent-2 -dns-domain aegis              # drain + tear down
+go run ./cmd/k3ac -name k3x -remove-node k3x-server-1 -dns-domain aegis             # server guard (must refuse)
+```
+
+**What I expected.** `add-agents` launches the next-indexed agent, which auto-joins via the saved
+`K3S_URL` FQDN + `K3S_TOKEN` (no separate join step), reusing the image recorded in `state.json`.
+`remove-node` drains the node from Kubernetes, tears down its container + named volume, and drops it
+from `state.json`. Removing the server is refused (that is `-destroy`).
+
+**What I saw.**
+- **add-agents PASS:** `k3x-agent-2` launched at `192.168.64.18`; joined via `https://k3x-server-1.aegis:6443`; `kubectl wait` reported it Ready; `kubectl get nodes` showed all three Ready (server + agent-1 + agent-2). `state.json` gained the node; its named volume `k3x-k3x-agent-2-k3s` was created; the stored `image` (`rancher/k3s:v1.32.5-k3s1`) was reused.
+- **remove-node PASS:** `kubectl delete node` drained it first; container stopped + removed and the named volume deleted in ~1 s; `kubectl get nodes` back to two; no leftover container or volume; `state.json` nodes = `[k3x-server-1, k3x-agent-1]`.
+- **server guard PASS:** `-remove-node k3x-server-1` exited non-zero with `node "k3x-server-1" is the cluster server; removing it would destroy the cluster — use -destroy instead`. No teardown attempted.
+
+**What surprised me.** Nothing. `add-agents` reuses Create's exact building blocks (named-volume
+stale-state guard, `launchNode`, `enableIPForward`, `assertDistinctIPs`) and `remove-node` reuses
+Destroy's per-node teardown (`stop`/`remove`/`volumeDelete`), so the membership paths cannot drift
+from create/destroy. The agent index is `max(existing)+1` (gaps from a removed agent are not
+backfilled), so a re-added agent never reuses a name whose datastore volume might still linger.
+
+**Verdict.** PASS. Agents can be added to and removed from a running cluster without recreate; the
+server is protected; teardown leaves no orphans.
+
+---
+
+## G9 — HA external-datastore: 2 servers survive a cold-restart DHCP IP shift ✅ PASS 2026-06-27 (v0.2.0 spike)
+
+This is the HA design spike behind ADR-0002. It is a **manual** experiment (hand-run
+`container run`, not yet a k3ac code path), recorded here for traceability. It proves the HA
+direction empirically before the k3ac multi-server implementation lands.
+
+**What I ran.** A PostgreSQL micro-VM `k3h-db.aegis` (named volume, `PGDATA` at a subdirectory)
+plus two k3s servers `k3h-srv-1.aegis` / `k3h-srv-2.aegis`, each launched with
+`--datastore-endpoint=postgres://kine:…@k3h-db.aegis:5432/kine`, `--flannel-backend=host-gw`,
+a shared `K3S_TOKEN`, and **no** `--cluster-init`. Confirmed both `Ready`/`control-plane,master`
+against the shared datastore, then seeded a marker ConfigMap (`ha-spike-marker`). Cold-stopped
+all three and restarted each individually (`container start` takes one ID), forcing the DHCP IP
+shift, then re-checked the control plane and the marker.
+
+**What I expected.** Unlike embedded etcd (ruled out in the prior session — etcd peer membership
+is IP-bound and cannot reform quorum after the IP shift, apiserver `ServiceUnavailable` for the
+full 180 s), an external datastore reached by FQDN has no IP-bound peer membership, so the control
+plane should reconnect by name and recover.
+
+**What I saw.**
+- **IP shift confirmed:** DB `.28→.31`, srv-1 `.29→.32`, srv-2 `.30→.33` — every node moved, the
+  exact condition that killed embedded etcd.
+- **Control plane recovered:** apiserver `/readyz` OK ~12 s after start; both nodes `Ready`/
+  `control-plane`. The apiserver answered on **both** server FQDN endpoints (`k3h-srv-1.aegis` and
+  `k3h-srv-2.aegis`) — true HA, either server serves.
+- **Datastore survived:** servers reconnected to `k3h-db.aegis` by name (A-record re-registered to
+  `.31`); the `ha-spike-marker` ConfigMap was intact with identical data.
+- **Workload plane reconverged:** each node's `InternalIP` and flannel `public-ip` annotation
+  re-registered to the new `.32`/`.33` (host-gw cross-node routing recovers too). A `kubectl get
+  nodes -o wide` issued in the first seconds after readiness briefly showed the old IPs — kubelet
+  posts the new IP a few seconds later; the proper jsonpath read confirmed `.32`/`.33`.
+
+**What surprised me.** The workload plane recovered without intervention — I expected to have to
+re-wire node IPs by hand. kubelet re-registers the new `InternalIP` and flannel updates its
+`public-ip` annotation on its own, so the host-gw routes reconverge. The only transient is the
+few-second window where the node object still carries the pre-restart IP.
+
+**Verdict.** PASS. Two stateless k3s servers on an external Postgres datastore at a stable FQDN
+survive the whole-cluster cold-restart DHCP IP shift that embedded etcd could not. This validates
+ADR-0002 option (b). The datastore itself is a single Postgres VM (not HA) — control plane is HA,
+datastore is not, until the datastore is separately replicated. Teardown removed all three
+containers and their named volumes with no daemon hang.
+
+---
+
+## G10 — k3ac one-command HA: managed datastore + multi-server, end to end ✅ PASS 2026-06-27 (v0.2.0)
+
+G9 proved the HA topology by hand. G10 proves k3ac's CODE drives it: the managed-datastore
+provisioning and the multi-server create path, plus cold-restart survival and clean teardown of
+the datastore node.
+
+**What I ran.** `k3ac -name hav -servers 2 -agents 1 -server-memory 1536 -agent-memory 1536`
+(no `-datastore-endpoint`, so k3ac provisions the datastore itself). Then `kubectl get nodes`,
+seeded a marker ConfigMap, cold-restarted all four containers (DB started first, one at a time),
+re-checked, and finally `k3ac -name hav -destroy`.
+
+**What I expected.** One command brings up `hav-db` (Postgres) + two servers wired to it via
+`--datastore-endpoint=postgres://…@hav-db.aegis:5432/kine` + one agent. The control plane survives
+the cold-restart IP shift (G9 property), and destroy reclaims the datastore node and its volume.
+
+**What I saw.**
+- **Bring-up PASS:** four VMs — `hav-db` (RoleDatastore), `hav-server-1`, `hav-server-2`,
+  `hav-agent-1`. `kubectl get nodes`: both servers `Ready`/`control-plane,master`, agent `Ready`.
+  `state.json` recorded `datastoreEndpoint` (password and all) and the four nodes with roles
+  `[datastore, server, server, agent]`.
+- **Cold-restart survival PASS:** every IP shifted (`.34/.35/.36/.37` → `.38/.39/.40/.41`).
+  apiserver `/readyz` answered within 3 s on the FQDN endpoint (re-resolved to the new IP); all
+  nodes `Ready` with internal IPs updated to the new addresses; the marker ConfigMap survived;
+  querying via the `hav-server-2.aegis` endpoint directly also served (HA — either server answers).
+- **Teardown PASS:** `-destroy` removed all four nodes (the datastore included) in 3.5 s with no
+  daemon hang; no leftover containers or volumes; the state dir was removed. The datastore volume
+  (`hav-db-pg`, off the k3s `nodeVolumeName` scheme) was reclaimed by the role-aware delete plus
+  the label sweep.
+
+**What surprised me.** Nothing new beyond G9 — the code path behaved exactly as the manual spike
+predicted. The managed-datastore stale-state guard, the PGDATA-subdir handling, and the role-aware
+teardown all worked first try on hardware because they mirror the create/destroy building blocks
+the single-server path already proved.
+
+**Verdict.** PASS. `k3ac -servers N` (N≥2) stands up a full HA control plane on a managed external
+datastore with one command, survives the cold-restart IP shift, and tears down cleanly. The
+datastore is a single Postgres VM (not itself HA) — control plane HA, datastore not, per ADR-0002.
 
 ---
 
