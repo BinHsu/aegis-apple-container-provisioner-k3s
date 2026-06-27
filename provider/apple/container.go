@@ -63,24 +63,13 @@ func (p *provisioner) run(ctx context.Context, args ...string) (string, error) {
 // `container exec <id> k3s kubectl ...` becomes effectively `k3s k3s kubectl ...` and
 // fails with "unknown command 'kubectl' for 'kubectl'". Only use exec for commands whose
 // first argument is NOT a k3s multi-call subcommand — sysctl passes cleanly because it
-// is a separate system binary, not a k3s symlink. Readiness is probed via containerCP
-// (see waitForReady in create.go), which has no such restriction.
+// is a separate system binary, not a k3s symlink. The kubeconfig is delivered via a host
+// bind-mount, NOT container cp/exec — see kubeconfigMount (node.go) and waitForReady
+// (create.go) for why the guest agent is avoided entirely.
 func (p *provisioner) exec(ctx context.Context, id string, args ...string) (string, error) {
 	full := append([]string{"exec", id}, args...)
 
 	return p.run(ctx, full...)
-}
-
-// containerCP copies a path from inside a container to the host via
-// `container cp <src> <dst>`. The primary use is the readiness probe in waitForReady:
-// k3s writes /etc/rancher/k3s/k3s.yaml only once the API server is fully initialized
-// (CA issued, control-plane healthy), so a successful cp is a reliable "server is up"
-// signal — and simultaneously delivers the operator's kubeconfig without relying on
-// `container exec` (which mangles the rancher/k3s multi-call binary's args).
-func (p *provisioner) containerCP(ctx context.Context, src, dst string) error {
-	_, err := p.run(ctx, "cp", src, dst)
-
-	return err
 }
 
 // containerInspect is the minimal subset of `container inspect <id>` JSON we consume.

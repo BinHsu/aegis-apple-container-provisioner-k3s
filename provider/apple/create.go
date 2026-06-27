@@ -5,6 +5,7 @@ package apple
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -84,10 +85,29 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 
 	server, agents := splitRoles(cfg.Nodes)
 
-	// 1) Launch the SERVER node.
+	// The kubeconfig is delivered via a host BIND-MOUNT, not container cp. k3s writes its
+	// admin kubeconfig into the bind-mounted cluster state dir (--write-kubeconfig), and we
+	// read it straight off the host filesystem. This avoids container cp / exec entirely —
+	// both ride the guest agent (vminitd over vsock), which faults under k3s's cold-boot
+	// image-extraction I/O and SIGKILLs the cp, cascading to a whole-daemon stop/rm hang
+	// (Apple containerization #678/#712, container #861; verified 2026-06-27). The mount
+	// must exist before the server launches, so resolve+create it now and hand the absolute
+	// path to the server's run args. (Absolute is also required: container resolves a
+	// relative bind source against the container root.)
+	rel := filepath.Join(cfg.StateDir, cfg.Name)
+	clusterDir, err := filepath.Abs(rel)
+	if err != nil {
+		return ClusterState{}, fmt.Errorf("resolving cluster state dir %q: %w", rel, err)
+	}
+	if err := os.MkdirAll(clusterDir, 0o755); err != nil {
+		return ClusterState{}, fmt.Errorf("creating cluster state dir %q: %w", clusterDir, err)
+	}
+
+	// 1) Launch the SERVER node. clusterDir is bind-mounted so k3s writes the kubeconfig
+	// straight to the host (see the note above).
 	fmt.Fprintln(logw, "launching k3s server", server.Name)
 
-	serverInfo, err := p.launchNode(ctx, cfg, server, "")
+	serverInfo, err := p.launchNode(ctx, cfg, server, "", clusterDir)
 	if err != nil {
 		return ClusterState{}, err
 	}
@@ -101,20 +121,14 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		return ClusterState{}, fmt.Errorf("server %q: %w", server.Name, err)
 	}
 
-	// 3) Wait for k3s to initialize by polling `container cp` for k3s.yaml.
-	// k3s writes /etc/rancher/k3s/k3s.yaml only once the API server is fully up, so a
-	// successful cp is a reliable "server is up" signal. It also delivers the kubeconfig
-	// in one shot — no separate fetch step. Ensure the cluster state dir exists first.
-	clusterDir := filepath.Join(cfg.StateDir, cfg.Name)
-	if err := os.MkdirAll(clusterDir, 0o755); err != nil {
-		return ClusterState{}, fmt.Errorf("creating cluster state dir %q: %w", clusterDir, err)
-	}
+	// 3) Wait for the k3s API server to answer on the network, then read the kubeconfig that
+	// k3s has written to the bind-mounted host dir. No container cp — see the note above.
+	kubeconfigSrc := filepath.Join(clusterDir, kubeconfigFileName) // written by k3s via the mount
+	kubeconfigPath := filepath.Join(clusterDir, "kubeconfig")      // operator copy, endpoint rewritten
 
-	kubeconfigPath := filepath.Join(clusterDir, "kubeconfig")
+	fmt.Fprintln(logw, "waiting for k3s API server on the network")
 
-	fmt.Fprintln(logw, "waiting for k3s to initialize (polling k3s.yaml via container cp)")
-
-	if err := p.waitForReady(ctx, serverInfo.ID, kubeconfigPath); err != nil {
+	if err := p.waitForReady(ctx, serverIP, kubeconfigSrc); err != nil {
 		return ClusterState{}, fmt.Errorf("server %q readiness: %w", server.Name, err)
 	}
 
@@ -128,9 +142,9 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		serverURL = "https://" + net.JoinHostPort(serverIP.String(), strconv.Itoa(k3sAPIPort))
 	}
 
-	raw, err := os.ReadFile(kubeconfigPath)
+	raw, err := os.ReadFile(kubeconfigSrc)
 	if err != nil {
-		return ClusterState{}, fmt.Errorf("reading fetched kubeconfig: %w", err)
+		return ClusterState{}, fmt.Errorf("reading kubeconfig written by k3s at %q: %w", kubeconfigSrc, err)
 	}
 
 	if err := os.WriteFile(kubeconfigPath, rewriteKubeconfigServer(raw, serverURL), 0o600); err != nil {
@@ -145,7 +159,7 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 	for _, agent := range agents {
 		fmt.Fprintln(logw, "launching k3s agent", agent.Name, "->", serverURL)
 
-		info, err := p.launchNode(ctx, cfg, agent, serverURL)
+		info, err := p.launchNode(ctx, cfg, agent, serverURL, "")
 		if err != nil {
 			return ClusterState{}, err
 		}
@@ -181,8 +195,8 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 }
 
 // launchNode runs one node and returns its NodeInfo once it has a vmnet IP.
-func (p *provisioner) launchNode(ctx context.Context, cfg ClusterConfig, node NodeConfig, serverURL string) (NodeInfo, error) {
-	args := buildRunArgs(cfg, node, serverURL, p.dnsDomain)
+func (p *provisioner) launchNode(ctx context.Context, cfg ClusterConfig, node NodeConfig, serverURL, kubeconfigHostDir string) (NodeInfo, error) {
+	args := buildRunArgs(cfg, node, serverURL, p.dnsDomain, kubeconfigHostDir)
 
 	if _, err := p.run(ctx, args...); err != nil {
 		return NodeInfo{}, fmt.Errorf("launching node %q: %w", node.Name, err)
@@ -217,49 +231,95 @@ func (p *provisioner) enableIPForward(ctx context.Context, id string) error {
 	return nil
 }
 
-// readyTimeout bounds how long we wait for the k3s server to initialize.
+// readyTimeout bounds how long we wait for the k3s API server to start answering on
+// <serverIP>:6443. k3s on a cold VM is normally serving within ~60-90s; 120s leaves margin
+// for a slow image-extraction boot without waiting on a genuinely dead server forever.
 const readyTimeout = 120 * time.Second
 
-// cpAttemptTimeout bounds a single `container cp` readiness probe so a wedged container daemon
-// (e.g. under extreme host memory pressure) cannot hang the readiness loop forever — the attempt
-// is killed via its context and retried until readyTimeout. (Origin 2026-06-26: a cp wedged ~4h
-// with no per-call bound, holding the VM's RAM and a stuck daemon.)
-const cpAttemptTimeout = 15 * time.Second
+// apiDialTimeout and apiPollInterval bound the host-side TLS readiness probe: each dial
+// gives up after apiDialTimeout, and we re-dial every apiPollInterval until readyTimeout.
+const (
+	apiDialTimeout  = 5 * time.Second
+	apiPollInterval = 3 * time.Second
+)
 
-// waitForReady polls until the k3s server has written /etc/rancher/k3s/k3s.yaml. k3s
-// only creates this file once the API server is fully initialized (CA issued,
-// control-plane healthy), so a successful `container cp` is a reliable "server is up"
-// signal. The file is written directly to kubeconfigPath, so the caller can immediately
-// rewrite the server URL and hand it to the operator — no separate fetch step needed.
+// kubeconfigWriteTimeout / kubeconfigPollInterval bound the wait for k3s to finish writing
+// its admin kubeconfig to the bind-mounted host path. The API server being up normally
+// means the file is already present; this only covers the brief write race.
+const (
+	kubeconfigWriteTimeout = 30 * time.Second
+	kubeconfigPollInterval = 1 * time.Second
+)
+
+// waitForReady gates bring-up on the k3s API server becoming reachable from the HOST over
+// the network, then waits for k3s to land its admin kubeconfig on the bind-mounted host
+// path. Neither step touches the guest agent.
 //
-// WHY cp AND NOT exec: `container exec` mangles the rancher/k3s multi-call binary's args.
-// `container exec <id> k3s kubectl get --raw /readyz` produces "unknown command 'kubectl'
-// for 'kubectl'" — verified on G1 hardware 2026-06-26. `container cp` has no such
-// restriction; it copies the file directly from the container filesystem.
-func (p *provisioner) waitForReady(ctx context.Context, id, kubeconfigPath string) error {
-	deadline := time.Now().Add(readyTimeout)
-	src := id + ":/etc/rancher/k3s/k3s.yaml"
+// WHY no cp/exec: `container cp` and `container exec` both ride the guest agent (vminitd
+// over vsock), which faults under k3s's cold-boot image-extraction I/O — even a single
+// un-killed cp in that window gets SIGKILLed, and the fault cascades to container stop/rm
+// (whole-daemon hang, recoverable only by force-killing the runtime helper; verified
+// 2026-06-27, Apple containerization #678/#712). A host-side TLS dial to <serverIP>:6443 is
+// answered by kube-apiserver directly, and the kubeconfig arrives via a host bind-mount
+// (see kubeconfigMount), so the whole readiness+delivery path is guest-agent-free.
+func (p *provisioner) waitForReady(ctx context.Context, serverIP netip.Addr, kubeconfigSrc string) error {
+	if err := p.waitForAPIServer(ctx, serverIP); err != nil {
+		return err
+	}
+
+	return waitForKubeconfigFile(ctx, kubeconfigSrc)
+}
+
+// waitForKubeconfigFile waits for k3s to write a non-empty admin kubeconfig to the
+// bind-mounted host path. Pure host filesystem (os.Stat) — no container cp/exec, so it
+// cannot wedge the guest agent.
+func waitForKubeconfigFile(ctx context.Context, path string) error {
+	deadline := time.Now().Add(kubeconfigWriteTimeout)
 
 	for {
-		attemptCtx, cancel := context.WithTimeout(ctx, cpAttemptTimeout)
-		err := p.containerCP(attemptCtx, src, kubeconfigPath)
-		cancel()
-
-		if err == nil {
+		if info, err := os.Stat(path); err == nil && info.Size() > 0 {
 			return nil
 		}
 
 		if time.Now().After(deadline) {
-			return fmt.Errorf(
-				"timed out after %s: k3s.yaml not yet written by %q (server may still be initializing)",
-				readyTimeout, id,
-			)
+			return fmt.Errorf("k3s did not write a kubeconfig to %q within %s", path, kubeconfigWriteTimeout)
 		}
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-time.After(kubeconfigPollInterval):
+		}
+	}
+}
+
+// waitForAPIServer polls a TLS handshake against <serverIP>:6443 until kube-apiserver
+// answers or readyTimeout elapses. A completed handshake means the API server is up (and
+// therefore k3s.yaml has been written). The probe never trusts the connection — it only
+// proves the listener is live — so certificate verification is skipped.
+func (p *provisioner) waitForAPIServer(ctx context.Context, serverIP netip.Addr) error {
+	addr := net.JoinHostPort(serverIP.String(), strconv.Itoa(k3sAPIPort))
+	deadline := time.Now().Add(readyTimeout)
+	dialer := &net.Dialer{Timeout: apiDialTimeout}
+	tlsCfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // readiness probe only; the connection is closed immediately and never trusted.
+
+	var lastErr error
+	for {
+		conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		lastErr = err
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("k3s API server at %s not reachable within %s: %w", addr, readyTimeout, lastErr)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(apiPollInterval):
 		}
 	}
 }

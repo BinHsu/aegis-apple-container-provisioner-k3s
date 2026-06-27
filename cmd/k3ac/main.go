@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-// Command aegis-k3s is a thin driver that boots a k3s cluster on Apple's `container`
+// Command k3ac (k3s on Apple container) is a thin driver that boots a k3s cluster on Apple's `container`
 // runtime via the apple launcher. Unlike the Talos sibling (which mirrors what
 // `talosctl cluster create` does because Talos has a provisioner framework), k3s has
 // NO upstream provisioner interface — so this driver IS the entry point, not a precursor
@@ -21,7 +21,7 @@ const mib = 1024 * 1024
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatalf("aegis-k3s: %v", err)
+		log.Fatalf("k3ac: %v", err)
 	}
 }
 

@@ -1,0 +1,33 @@
+# Minimal real-workload smoke test: an nginx Deployment + ClusterIP Service.
+# Used by docs/VERIFICATION.md G6 (in-cluster DNS + Service routing) and the
+# README smoke test. Apply with: kubectl apply -f examples/nginx.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+spec:
+  selector:
+    app: nginx
+  ports:
+    - port: 80
+      targetPort: 80

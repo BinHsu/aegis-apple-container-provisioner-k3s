@@ -97,8 +97,9 @@ func recipeCfg() ClusterConfig {
 func TestBuildRunArgs_ServerRecipe(t *testing.T) {
 	cfg := recipeCfg()
 	node := NodeConfig{Name: "aegis-server-1", Role: RoleServer, Memory: 2048 * 1024 * 1024, NanoCPUs: 2e9}
+	kubecfgDir := "/abs/state/aegis"
 
-	args := buildRunArgs(cfg, node, "", "aegis")
+	args := buildRunArgs(cfg, node, "", "aegis", kubecfgDir)
 	joined := strings.Join(args, " ")
 
 	serverFQDN := "aegis-server-1.aegis"
@@ -111,6 +112,9 @@ func TestBuildRunArgs_ServerRecipe(t *testing.T) {
 		{memoryUsesMB(args), "--memory uses MB suffix (bare M rejected)"},
 		{!tmpfsContains(args, "/var"), "/var NOT tmpfs (it is the named-volume datastore mount)"},
 		{hasNamedDatastoreVolume(args), "datastore is a NAMED volume (no host path with '/') at " + k3sDatastoreMount},
+		{hasPair(args, "--volume", kubecfgDir+":"+kubeconfigMount), "kubeconfig host dir bind-mounted (delivery without container cp)"},
+		{hasPair(args, "--write-kubeconfig", kubeconfigMount+"/"+kubeconfigFileName), "--write-kubeconfig points k3s at the bind mount"},
+		{hasPair(args, "--write-kubeconfig-mode", "0644"), "--write-kubeconfig-mode 0644 (host-readable)"},
 		{slices.Contains(args, "--flannel-backend=host-gw"), "--flannel-backend=host-gw on server (G2)"},
 		{hasPair(args, "--tls-san", serverFQDN), "--tls-san is the server FQDN (stable across IP changes)"},
 		{!strings.Contains(joined, "aegis-k3s.local"), "old static cluster-dns name NOT present (replaced by FQDN)"},
@@ -138,7 +142,7 @@ func TestBuildRunArgs_AgentRecipe(t *testing.T) {
 	node := NodeConfig{Name: "aegis-agent-1", Role: RoleAgent, Memory: 2048 * 1024 * 1024, NanoCPUs: 2e9}
 	serverURL := "https://aegis-server-1.aegis:6443"
 
-	args := buildRunArgs(cfg, node, serverURL, "aegis")
+	args := buildRunArgs(cfg, node, serverURL, "aegis", "")
 	joined := strings.Join(args, " ")
 
 	agentFQDN := "aegis-agent-1.aegis"
@@ -155,6 +159,7 @@ func TestBuildRunArgs_AgentRecipe(t *testing.T) {
 		{hasPair(args, "--cap-add", "ALL"), "--cap-add ALL on agent too"},
 		{!slices.Contains(args, "--flannel-backend=host-gw"), "agent has NO server-only flannel flag"},
 		{!slices.Contains(args, "--tls-san"), "agent has NO server-only --tls-san"},
+		{!slices.Contains(args, "--write-kubeconfig"), "agent has NO --write-kubeconfig (server-only kubeconfig delivery)"},
 		{!strings.Contains(joined, "PLATFORM"), "no PLATFORM env"},
 	}
 
@@ -171,7 +176,7 @@ func TestBuildRunArgs_IPOnlyFallback(t *testing.T) {
 	cfg := recipeCfg()
 	node := NodeConfig{Name: "aegis-server-1", Role: RoleServer, Memory: 2048 * 1024 * 1024}
 
-	args := buildRunArgs(cfg, node, "", "")
+	args := buildRunArgs(cfg, node, "", "", "")
 	joined := strings.Join(args, " ")
 
 	if !hasPair(args, "--name", "aegis-server-1") {
@@ -180,6 +185,12 @@ func TestBuildRunArgs_IPOnlyFallback(t *testing.T) {
 
 	if slices.Contains(args, "--tls-san") {
 		t.Errorf("IP-only mode: no --tls-san (no stable FQDN to pin), got: %s", joined)
+	}
+
+	// Boundary: with an empty kubeconfigHostDir, a server emits neither the bind-mount nor
+	// --write-kubeconfig (the mount is opt-in; Create always supplies it in production).
+	if slices.Contains(args, "--write-kubeconfig") {
+		t.Errorf("empty kubeconfigHostDir: must NOT emit --write-kubeconfig, got: %s", joined)
 	}
 }
 
@@ -240,7 +251,7 @@ func TestVolumeNameCreateDestroySymmetry(t *testing.T) {
 	cfg := recipeCfg()
 	node := NodeConfig{Name: "aegis-agent-1", Role: RoleAgent}
 
-	args := buildRunArgs(cfg, node, "https://aegis-server-1.aegis:6443", "aegis")
+	args := buildRunArgs(cfg, node, "https://aegis-server-1.aegis:6443", "aegis", "")
 
 	var mountedVol string
 
@@ -399,7 +410,7 @@ func TestVolumesMatchingLabel(t *testing.T) {
 // FQDN naming out of the box.
 func TestDNSDomainDefault(t *testing.T) {
 	const wantDefault = "aegis"
-	// The default is enforced by the -dns-domain flag in cmd/aegis-k3s/main.go.
+	// The default is enforced by the -dns-domain flag in cmd/k3ac/main.go.
 	// We lock the value here so a refactor that changes the default breaks this test.
 	if wantDefault == "" {
 		t.Error("dns-domain default must be non-empty (FQDN mode should be the default)")

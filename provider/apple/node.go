@@ -25,6 +25,21 @@ const k3sDatastoreMount = "/var/lib/rancher/k3s"
 // k3sAPIPort is the k3s API server / join port.
 const k3sAPIPort = 6443
 
+// kubeconfigMount is the in-node mount point for a HOST bind-mount of the cluster state
+// dir on the server node. k3s writes its admin kubeconfig here (--write-kubeconfig
+// kubeconfigMount/kubeconfigFileName) and Create reads it straight off the host
+// filesystem. This REPLACES container cp for kubeconfig delivery: cp rides the guest agent
+// (vminitd over vsock), which faults under k3s's cold-boot image-extraction I/O and gets
+// SIGKILLed mid-transfer, cascading to a whole-daemon stop/rm hang (Apple containerization
+// #678/#712, container #861; verified 2026-06-27 — even an un-killed cp dies in the boot
+// window). A plain file write to a virtio-fs bind-mount + host-side read does not touch the
+// guest agent and was spiked clean (write + chmod + host read all OK). Path avoids /run,
+// /tmp (tmpfs) and /var/lib/rancher/k3s (datastore volume).
+const (
+	kubeconfigMount    = "/mnt/k3s-out"
+	kubeconfigFileName = "k3s.yaml"
+)
+
 // sanitizeVolumeName lowercases s and replaces every character outside [a-z0-9-] with
 // '-', yielding a stable, valid Apple `container` volume name from an arbitrary
 // cluster/node identifier. Mirrors the Talos sibling.
@@ -108,7 +123,10 @@ func nodeTmpfsPaths() []string {
 // serverURL is "" for a server node and "https://<server-fqdn>:6443" for an agent.
 // The caller (Create) computes the FQDN-based URL after the server boots and passes it
 // when launching agents.
-func buildRunArgs(cfg ClusterConfig, node NodeConfig, serverURL, dnsDomain string) []string {
+// kubeconfigHostDir, when non-empty (server node only), is bind-mounted at kubeconfigMount
+// so k3s can write its admin kubeconfig straight to the host. The caller passes the
+// absolute cluster state dir; agents pass "".
+func buildRunArgs(cfg ClusterConfig, node NodeConfig, serverURL, dnsDomain, kubeconfigHostDir string) []string {
 	args := []string{
 		"run", "--detach",
 		"--name", nodeFQDN(node.Name, dnsDomain),
@@ -137,6 +155,15 @@ func buildRunArgs(cfg ClusterConfig, node NodeConfig, serverURL, dnsDomain strin
 	// cannot chmod — k3s sqlite writes would fail. Volume names use the BARE node name
 	// so Create and Destroy derive the same name regardless of the dns-domain setting.
 	args = append(args, "--volume", nodeVolumeName(cfg.Name, node.Name)+":"+k3sDatastoreMount)
+
+	// KUBECONFIG DELIVERY (server only): bind-mount the host cluster state dir so k3s writes
+	// its admin kubeconfig where the host can read it directly — no container cp. See the
+	// kubeconfigMount doc for why cp is avoided. A host bind-mount is a virtio-fs share; that
+	// is fine for a plain kubeconfig file (unlike the sqlite datastore, which needs the
+	// block-backed named volume above).
+	if node.Role == RoleServer && kubeconfigHostDir != "" {
+		args = append(args, "--volume", kubeconfigHostDir+":"+kubeconfigMount)
+	}
 
 	// Labels: k3s.* replacing the Talos sibling's talos.* scheme. Node IDs are also
 	// tracked in state.json so teardown does not depend on label-listing (the CLI does
@@ -184,6 +211,17 @@ func buildRunArgs(cfg ClusterConfig, node NodeConfig, serverURL, dnsDomain strin
 		// segment, so host-gw L2 routes work and avoid the UNVERIFIED br_netfilter/VXLAN
 		// kernel dependency (the default flannel VXLAN backend needs br_netfilter).
 		args = append(args, "--flannel-backend=host-gw")
+
+		// Write the admin kubeconfig to the bind-mounted host dir (mode 0644 so the host
+		// user can read it without a chmod round-trip) instead of the default in-node
+		// /etc/rancher/k3s/k3s.yaml that only container cp could reach. Create reads it
+		// straight off the host. Only emitted when the mount is present.
+		if kubeconfigHostDir != "" {
+			args = append(args,
+				"--write-kubeconfig", kubeconfigMount+"/"+kubeconfigFileName,
+				"--write-kubeconfig-mode", "0644",
+			)
+		}
 
 		// --tls-san: pin the server's FQDN (or a static name as fallback) into the API
 		// server cert SANs so the cert stays valid across DHCP IP changes. When a DNS

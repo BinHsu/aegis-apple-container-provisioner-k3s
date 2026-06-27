@@ -2,12 +2,15 @@
 
 A standalone launcher that boots k3s clusters as Apple Silicon micro-VMs via Apple's [`container`](https://github.com/apple/container) tool — **NOT** a k3s upstream provider interface (k3s has none).
 
-> **Status: G1 VERIFIED — G2/G3/G5 are the next hardware gates.** G1 (does k3s's embedded
-> containerd start under Apple `vminitd` with `--cap-add ALL`?) passed 2026-06-26 with
-> `rancher/k3s:v1.32.5-k3s1`. G2 (pod networking), G3 (named-volume datastore persistence
-> across cold restart), and G5 (FQDN endpoint survives cold-restart IP change) are the
-> remaining hardware gates — verified by the operator; see
-> [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
+> **Status: v0.1.0 — all hardware gates GREEN (2026-06-27).** G1–G7 verified on Apple
+> Silicon with `container` 1.0.0 and `rancher/k3s:v1.32.5-k3s1`: k3s boots under `vminitd`,
+> multi-node `host-gw` networking, named-volume sqlite persistence across cold restart,
+> host-side readiness + bind-mount kubeconfig delivery (no `container cp`), FQDN endpoint
+> survives cold-restart IP changes, real workload + Traefik ingress, and no-hang teardown.
+> A forker clean-room run (the documented commands, from zero) reproduced the full lifecycle.
+> See [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for the first-person runbook and
+> [`docs/ADR/0001-kubeconfig-delivery-via-host-bind-mount.md`](docs/ADR/0001-kubeconfig-delivery-via-host-bind-mount.md)
+> for the kubeconfig-delivery design.
 
 ## What it is (and isn't)
 
@@ -40,10 +43,12 @@ key recipe deltas from Talos:
 ## Datastore: named volumes (not host paths)
 
 `/var/lib/rancher/k3s` is backed by an Apple `container` **named volume**
-(`<cluster>-<node>-k3s`) rather than a host-path bind-mount. This is the v0.1.0 lesson
-from the Talos sibling: host-path bind-mounts are virtio-fs shares the guest cannot chmod
-(EPERM). Named volumes are block-backed ext4 owned by the guest root, so chmod succeeds
-and the sqlite datastore writes correctly. See `docs/VERIFICATION.md` G3.
+(`<cluster>-<node>-k3s`) rather than a host-path bind-mount. Named volumes are
+block-backed ext4 owned by the guest root. The reason for avoiding a virtio-fs
+bind-mount here is sqlite's WAL and advisory file-locking semantics, which are not
+well-defined over virtio-fs shares. Plain sequential file writes to virtio-fs work fine
+(spiked 2026-06-27); it is the sqlite-specific locking paths that are the concern. See
+`docs/VERIFICATION.md` G3.
 
 ## FQDN endpoint (`-dns-domain`)
 
@@ -66,7 +71,7 @@ fails early with a clear error telling you to run the above command.
 To disable FQDN naming and fall back to IP-based naming (v0.1.x behaviour):
 
 ```sh
-go run ./cmd/aegis-k3s -dns-domain "" -name aegis -agents 1
+go run ./cmd/k3ac -dns-domain "" -name aegis -agents 1
 ```
 
 ## Lifecycle
@@ -75,7 +80,7 @@ go run ./cmd/aegis-k3s -dns-domain "" -name aegis -agents 1
 validate → ensureNetwork → DNS domain precheck
   → prepareNodeVolumes (create named volumes, stale-state guard)
   → launch SERVER (sqlite + host-gw + tls-san=<server-fqdn> + K3S_TOKEN)
-  → waitForIPv4 → exec sysctl ip_forward=1 → poll k3s.yaml via container cp (readiness + kubeconfig delivery)
+  → waitForIPv4 → exec sysctl ip_forward=1 → TLS dial https://<server-fqdn>:6443 (readiness) → os.Stat /mnt/k3s-out/k3s.yaml via bind-mount (kubeconfig delivery)
   → launch each AGENT (K3S_URL=https://<server-fqdn>:6443 + K3S_TOKEN)
   → waitForIPv4 → exec sysctl → saveState
 ```
@@ -102,37 +107,71 @@ export KUBECONFIG=_out/clusters/aegis/kubeconfig
 kubectl get nodes
 ```
 
-**What the provisioner does:** after the server starts, it polls `container cp
-<server-fqdn>:/etc/rancher/k3s/k3s.yaml` until k3s writes the file (a reliable
-initialization signal — k3s only creates `k3s.yaml` once the API server is up and the CA
-has been issued). It then rewrites the server address from the loopback
-(`https://127.0.0.1:6443`) to the FQDN endpoint (`https://<server-fqdn>:6443`), which is
-valid because `--tls-san` covers the FQDN. The FQDN endpoint survives cold-restart IP
-changes (gate G5).
+**What the provisioner does:** readiness and kubeconfig delivery use the host filesystem
+and network directly — no guest agent involved.
 
-**Why `container cp` and not `container exec`:** `container exec` mangles the rancher/k3s
-multi-call binary's args. `k3s kubectl`, `k3s crictl`, etc. are all symlinks to the same
-`k3s` binary; `container exec <id> k3s kubectl ...` produces
-`unknown command "kubectl" for "kubectl"` — verified 2026-06-26. `container cp` has no
-such restriction and copies the file directly from the container filesystem.
+1. **Readiness:** the provisioner dials `https://<server-IP>:6443` from the host. The
+   kube-apiserver answers TLS on that port; no `container exec` or `container cp` needed.
+2. **Kubeconfig delivery:** the server container bind-mounts the host cluster state
+   directory at `/mnt/k3s-out` inside the VM. k3s writes its kubeconfig there via
+   `--write-kubeconfig /mnt/k3s-out/k3s.yaml --write-kubeconfig-mode 0644`. The
+   provisioner polls `os.Stat` for the file, rewrites the server address from
+   `https://127.0.0.1:6443` to the FQDN endpoint (`https://<server-fqdn>:6443`), and
+   writes the result to `<stateDir>/<cluster>/kubeconfig`. Zero `container cp` or
+   `container exec` involved. The FQDN endpoint survives cold-restart IP changes (gate G5).
+
+**Why not `container cp` or `container exec`:** both ride the guest agent (vminitd) over
+vsock. During k3s cold boot the guest is saturated extracting bundled images; this faults
+the vsock channel and the cp process is killed externally — verified at 180 s timeout on
+hardware. A faulted vsock also wedges `container stop` and `container rm` for two or more
+minutes. The bind-mount + TLS-probe design avoids the guest agent entirely for the
+critical path. See
+[`docs/ADR/0001-kubeconfig-delivery-via-host-bind-mount.md`](docs/ADR/0001-kubeconfig-delivery-via-host-bind-mount.md)
+for the full analysis. (`container exec` is still used for one early, standalone-binary
+call: `sysctl net.ipv4.ip_forward=1`.)
 
 ## Usage
 
+`k3ac` is **this repo's launcher** — not a k3s subcommand. k3s has no pluggable
+provisioner interface (unlike Talos's `pkg/provision.Provisioner`), so cluster bring-up is
+driven by this freestanding binary, which execs the `container` CLI to boot k3s nodes as
+micro-VMs. Run it from source with `go run`, or build it once and call the binary:
+
 ```sh
-# Prerequisites (once per macOS boot):
+go build -o k3ac ./cmd/k3ac
+./k3ac -name aegis -agents 1
+```
+
+```sh
+# Prerequisites (once per macOS boot — the pf DNS redirect does not survive a reboot):
 sudo container system dns create aegis
 
 # Create a 1-server + 1-agent cluster (FQDN mode, default):
-go run ./cmd/aegis-k3s -name aegis -agents 1
+go run ./cmd/k3ac -name aegis -agents 1
 
 # Create with a custom domain:
-go run ./cmd/aegis-k3s -name aegis -agents 1 -dns-domain myk3s
+go run ./cmd/k3ac -name aegis -agents 1 -dns-domain myk3s
 
 # Create in IP-only mode (no FQDN, no DNS prereq):
-go run ./cmd/aegis-k3s -name aegis -agents 1 -dns-domain ""
+go run ./cmd/k3ac -name aegis -agents 1 -dns-domain ""
 
 # Tear it down (removes nodes, named volumes, network, state):
-go run ./cmd/aegis-k3s -name aegis -destroy
+go run ./cmd/k3ac -name aegis -destroy
+```
+
+### Smoke test (optional — prove the cluster actually serves traffic)
+
+```sh
+export KUBECONFIG=_out/clusters/aegis/kubeconfig
+kubectl apply -f examples/nginx.yaml       # nginx Deployment + ClusterIP Service
+kubectl apply -f examples/ingress.yaml     # Traefik Ingress: host demo.local
+kubectl wait --for=condition=available deployment/nginx --timeout=120s
+
+# Host-side ingress check via Traefik's node port 80 (k3s ships Traefik by default):
+NODE_IP=$(kubectl get node aegis-server-1 \
+  -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: demo.local' http://${NODE_IP}/   # 200
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: nope.local' http://${NODE_IP}/   # 404
 ```
 
 ## Flags
@@ -164,14 +203,18 @@ make check      # all of the above
 CI (`go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run ./...`) runs
 automatically on push/PR via `.github/workflows/ci.yml`.
 
-## Open hardware gates
+## Verified hardware gates (2026-06-27)
 
-- **G2:** pod-to-pod networking across vmnet node-VMs with `--flannel-backend=host-gw`
-- **G3:** named-volume datastore persists across `container stop/start` and `rm` + relaunch
-- **G5:** FQDN endpoint + named volume survives a cold restart on a new DHCP IP
+All green on Apple Silicon, `container` 1.0.0, `rancher/k3s:v1.32.5-k3s1` — see
+[`docs/VERIFICATION.md`](docs/VERIFICATION.md) for the first-person runbook with exact commands:
 
-See [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for hypotheses, test commands, and
-fill-in sections.
+- **G1** — k3s embedded containerd boots under `vminitd` + `--cap-add ALL`
+- **G2** — pod-to-pod across nodes with `--flannel-backend=host-gw` (0% loss both ways)
+- **G3** — named-volume sqlite datastore persists across a cold container stop/start
+- **G4** — host-side TLS readiness + bind-mount kubeconfig delivery (zero `container cp`)
+- **G5** — FQDN endpoint survives a cold restart on a new DHCP IP (zero re-point)
+- **G6** — real workload (nginx) + built-in Traefik ingress, host-reachable (200 / 404)
+- **G7** — teardown via both `state.json` and label-sweep paths, no daemon hang (~1 s)
 
 ## Requirements
 
