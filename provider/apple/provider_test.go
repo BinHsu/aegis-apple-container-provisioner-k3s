@@ -553,6 +553,77 @@ func TestLoadStateForDestroy(t *testing.T) {
 	})
 }
 
+// TestNextAgentIndex is the BVA on the agent set (CLAUDE.md k) that drives new-agent
+// numbering in AddAgents. The boundary is the set of existing <cluster>-agent-<N> names:
+//   - 0 agents (only a server): next is 1 (no agents -> start at 1).
+//   - agents 1,2 (contiguous): next is 3 (max+1).
+//   - agents 1,3 (a gap, e.g. agent-2 removed): next is 4 (max+1, NOT count+1 — a freed
+//     index is never backfilled, so a recreated agent cannot reuse a stale volume name).
+//   - names that do not match <cluster>-agent-<N> (the server, a foreign/non-numeric
+//     suffix) are ignored.
+func TestNextAgentIndex(t *testing.T) {
+	mk := func(name string, role Role) NodeInfo { return NodeInfo{Name: name, Role: role} }
+
+	tests := []struct {
+		name    string
+		cluster string
+		nodes   []NodeInfo
+		want    int
+	}{
+		{
+			name:    "0 agents, server only: next is 1",
+			cluster: "aegis",
+			nodes:   []NodeInfo{mk("aegis-server-1", RoleServer)},
+			want:    1,
+		},
+		{
+			name:    "agents 1,2 contiguous: next is 3 (max+1)",
+			cluster: "aegis",
+			nodes:   []NodeInfo{mk("aegis-server-1", RoleServer), mk("aegis-agent-1", RoleAgent), mk("aegis-agent-2", RoleAgent)},
+			want:    3,
+		},
+		{
+			name:    "agents 1,3 with a gap: next is 4 (max+1, not count+1)",
+			cluster: "aegis",
+			nodes:   []NodeInfo{mk("aegis-server-1", RoleServer), mk("aegis-agent-1", RoleAgent), mk("aegis-agent-3", RoleAgent)},
+			want:    4,
+		},
+		{
+			name:    "non-matching names ignored (foreign cluster + non-numeric suffix)",
+			cluster: "aegis",
+			nodes:   []NodeInfo{mk("aegis-server-1", RoleServer), mk("other-agent-9", RoleAgent), mk("aegis-agent-x", RoleAgent), mk("aegis-agent-2", RoleAgent)},
+			want:    3,
+		},
+		{
+			name:    "empty node list: next is 1",
+			cluster: "aegis",
+			nodes:   nil,
+			want:    1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := nextAgentIndex(tt.nodes, tt.cluster); got != tt.want {
+				t.Errorf("nextAgentIndex(%v, %q) = %d, want %d", tt.nodes, tt.cluster, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEnsureRemovable_ServerGuard locks RemoveNode's load-bearing guard: a server node
+// may NOT be removed (that destroys the cluster — the -destroy path), while an agent
+// node is removable. Tests the extracted guard helper directly, so no container calls.
+func TestEnsureRemovable_ServerGuard(t *testing.T) {
+	if err := ensureRemovable(NodeInfo{Name: "aegis-server-1", Role: RoleServer}); err == nil {
+		t.Error("removing a server node must be refused (use -destroy)")
+	}
+
+	if err := ensureRemovable(NodeInfo{Name: "aegis-agent-1", Role: RoleAgent}); err != nil {
+		t.Errorf("removing an agent node must be allowed: %v", err)
+	}
+}
+
 // --- helpers ---
 
 // hasPair reports whether args contains flag immediately followed by value.

@@ -72,11 +72,17 @@ type NodeInfo struct {
 // reads back. The Talos sibling got persistence from provision.State; here it is a
 // plain JSON file.
 type ClusterState struct {
-	Provisioner string     `json:"provisioner"`
-	ClusterName string     `json:"clusterName"`
-	Network     string     `json:"network"`
-	Token       string     `json:"token"`
-	StateDir    string     `json:"stateDir"`
-	ServerURL   string     `json:"serverURL"` // https://<server-fqdn>:6443 (FQDN or IP)
-	Nodes       []NodeInfo `json:"nodes"`
+	Provisioner string `json:"provisioner"`
+	ClusterName string `json:"clusterName"`
+	Network     string `json:"network"`
+	Token       string `json:"token"`
+	StateDir    string `json:"stateDir"`
+	// Image is the RESOLVED rancher/k3s image the cluster was created with (the
+	// empty->defaultK3sImage step already applied). Persisted so a later AddAgents
+	// launches new agents on the exact same image as the original nodes. Pre-v0.2.0
+	// states predate this field and unmarshal to ""; AddAgents falls back to
+	// defaultK3sImage in that case.
+	Image     string     `json:"image"`
+	ServerURL string     `json:"serverURL"` // https://<server-fqdn>:6443 (FQDN or IP)
+	Nodes     []NodeInfo `json:"nodes"`
 }

@@ -39,6 +39,8 @@ func run() error {
 		agentMemMB  = flag.Int64("agent-memory", 2048, "agent memory (MB)")
 		agentCount  = flag.Int("agents", 1, "number of agent (worker) nodes")
 		destroy     = flag.Bool("destroy", false, "destroy the named cluster instead of creating it")
+		addAgents   = flag.Int("add-agents", 0, "add N agent nodes to an existing cluster")
+		removeNode  = flag.String("remove-node", "", "remove a node (by name) from an existing cluster")
 	)
 
 	flag.Parse()
@@ -72,6 +74,31 @@ func run() error {
 		}
 
 		fmt.Printf("destroyed cluster %q\n", *clusterName)
+
+		return nil
+	}
+
+	// Membership-change modes operate on an already-created cluster, so they take
+	// precedence over Create. -remove-node is checked before -add-agents so a single
+	// invocation does exactly one thing (remove wins if both are set).
+	if *removeNode != "" {
+		if err := prov.RemoveNode(ctx, *stateDir, *clusterName, *removeNode, log.Writer()); err != nil {
+			return fmt.Errorf("removing node %q from cluster %q: %w", *removeNode, *clusterName, err)
+		}
+
+		fmt.Printf("removed node %q from cluster %q\n", *removeNode, *clusterName)
+
+		return nil
+	}
+
+	if *addAgents > 0 {
+		// Same per-agent memory/CPU the create path uses (NanoCPUs 2e9 == 2 vCPU).
+		state, err := prov.AddAgents(ctx, *stateDir, *clusterName, *addAgents, *agentMemMB*mib, 2e9, log.Writer())
+		if err != nil {
+			return err
+		}
+
+		reportProvisioned(state, *dnsDomain)
 
 		return nil
 	}

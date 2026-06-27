@@ -157,6 +157,10 @@ go run ./cmd/k3ac -name aegis -agents 1 -dns-domain ""
 
 # Tear it down (removes nodes, named volumes, network, state):
 go run ./cmd/k3ac -name aegis -destroy
+
+# Grow / shrink a running cluster (membership ops — no recreate):
+go run ./cmd/k3ac -name aegis -add-agents 2               # add 2 agents (auto-join via the FQDN endpoint)
+go run ./cmd/k3ac -name aegis -remove-node aegis-agent-2  # drain from Kubernetes, then tear the node down
 ```
 
 ### Smoke test (optional — prove the cluster actually serves traffic)
@@ -188,6 +192,8 @@ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: nope.local' http://${NODE_IP}
 | `-state-dir` | `_out/clusters` | Directory for `state.json` |
 | `-network` | `default` | apple/container network name |
 | `-destroy` | `false` | Destroy the named cluster instead of creating |
+| `-add-agents` | `0` | Add N agent nodes to an existing cluster (membership op; auto-join via FQDN) |
+| `-remove-node` | `""` | Remove a node by name from an existing cluster (drains it from Kubernetes first; refuses the server) |
 
 ## Local checks
 

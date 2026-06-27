@@ -183,6 +183,7 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		Network:     cfg.Network,
 		Token:       cfg.Token,
 		StateDir:    cfg.StateDir,
+		Image:       cfg.Image, // resolved (empty->defaultK3sImage above); AddAgents reuses it
 		ServerURL:   serverURL,
 		Nodes:       nodes,
 	}

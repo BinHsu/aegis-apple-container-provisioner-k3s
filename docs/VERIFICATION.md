@@ -21,6 +21,7 @@ Every gate below carries the concrete evidence from those runs; verdicts are not
 | G5 | FQDN endpoint survives cold restart when DHCP shifts the IP | ✅ PASS (2026-06-27) |
 | G6 | Real workload + k3s built-in Traefik ingress reachable from the host | ✅ PASS (2026-06-27) |
 | G7 | Full lifecycle teardown — no daemon hang, both `state.json` and label-sweep paths | ✅ PASS (2026-06-27) |
+| G8 | Node membership — add/remove agents on a running cluster (v0.2.0) | ✅ PASS (2026-06-27) |
 
 ---
 
@@ -393,6 +394,40 @@ and it exited as cleanly as the normal path.
 
 **Verdict.** PASS. Both destroy paths — `state.json` and label-sweep fallback — exit cleanly
 in approximately 1 second with no daemon hang and no leftover resources.
+
+---
+
+## G8 — node membership: add / remove on a running cluster ✅ PASS 2026-06-27 (v0.2.0)
+
+**What I ran.** Provisioned `k3x` with one server + one agent (1536 MB each). Then exercised the
+membership operations against the running cluster:
+
+```sh
+go run ./cmd/k3ac -name k3x -add-agents 1 -agent-memory 1536 -dns-domain aegis      # add k3x-agent-2
+export KUBECONFIG=_out/clusters/k3x/kubeconfig
+kubectl wait --for=condition=Ready node/k3x-agent-2 --timeout=90s
+go run ./cmd/k3ac -name k3x -remove-node k3x-agent-2 -dns-domain aegis              # drain + tear down
+go run ./cmd/k3ac -name k3x -remove-node k3x-server-1 -dns-domain aegis             # server guard (must refuse)
+```
+
+**What I expected.** `add-agents` launches the next-indexed agent, which auto-joins via the saved
+`K3S_URL` FQDN + `K3S_TOKEN` (no separate join step), reusing the image recorded in `state.json`.
+`remove-node` drains the node from Kubernetes, tears down its container + named volume, and drops it
+from `state.json`. Removing the server is refused (that is `-destroy`).
+
+**What I saw.**
+- **add-agents PASS:** `k3x-agent-2` launched at `192.168.64.18`; joined via `https://k3x-server-1.aegis:6443`; `kubectl wait` reported it Ready; `kubectl get nodes` showed all three Ready (server + agent-1 + agent-2). `state.json` gained the node; its named volume `k3x-k3x-agent-2-k3s` was created; the stored `image` (`rancher/k3s:v1.32.5-k3s1`) was reused.
+- **remove-node PASS:** `kubectl delete node` drained it first; container stopped + removed and the named volume deleted in ~1 s; `kubectl get nodes` back to two; no leftover container or volume; `state.json` nodes = `[k3x-server-1, k3x-agent-1]`.
+- **server guard PASS:** `-remove-node k3x-server-1` exited non-zero with `node "k3x-server-1" is the cluster server; removing it would destroy the cluster — use -destroy instead`. No teardown attempted.
+
+**What surprised me.** Nothing. `add-agents` reuses Create's exact building blocks (named-volume
+stale-state guard, `launchNode`, `enableIPForward`, `assertDistinctIPs`) and `remove-node` reuses
+Destroy's per-node teardown (`stop`/`remove`/`volumeDelete`), so the membership paths cannot drift
+from create/destroy. The agent index is `max(existing)+1` (gaps from a removed agent are not
+backfilled), so a re-added agent never reuses a name whose datastore volume might still linger.
+
+**Verdict.** PASS. Agents can be added to and removed from a running cluster without recreate; the
+server is protected; teardown leaves no orphans.
 
 ---
 
