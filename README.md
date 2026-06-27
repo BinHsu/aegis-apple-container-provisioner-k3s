@@ -163,6 +163,20 @@ go run ./cmd/k3ac -name aegis -add-agents 2               # add 2 agents (auto-j
 go run ./cmd/k3ac -name aegis -remove-node aegis-agent-2  # drain from Kubernetes, then tear the node down
 ```
 
+### Declarative config file (`-config`)
+
+Describe a cluster once in JSON (stdlib-only — no YAML dependency) instead of repeating
+flags. Explicit flags override file values, which override built-in defaults:
+
+```sh
+go run ./cmd/k3ac -config examples/cluster.json              # all settings from the file
+go run ./cmd/k3ac -config examples/cluster.json -agents 3    # file, but override the agent count
+```
+
+Unknown keys are rejected (a typo like `serverMemoryMb` fails fast rather than being
+ignored). See [`examples/cluster.json`](examples/cluster.json). Note: because JSON cannot
+distinguish an absent `agents` key from `"agents": 0`, always declare `agents` in the file.
+
 ### Smoke test (optional — prove the cluster actually serves traffic)
 
 ```sh
@@ -194,6 +208,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: nope.local' http://${NODE_IP}
 | `-destroy` | `false` | Destroy the named cluster instead of creating |
 | `-add-agents` | `0` | Add N agent nodes to an existing cluster (membership op; auto-join via FQDN) |
 | `-remove-node` | `""` | Remove a node by name from an existing cluster (drains it from Kubernetes first; refuses the server) |
+| `-config` | `""` | Load cluster settings from a JSON file (explicit flags override file values) |
 
 ## Local checks
 

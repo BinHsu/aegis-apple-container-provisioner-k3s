@@ -27,6 +27,9 @@ func main() {
 
 func run() error {
 	var (
+		// -config feeds a declarative JSON cluster spec; explicit flags always override it.
+		// Precedence: built-in defaults < config file < explicit flags (via flag.Visit).
+		configPath  = flag.String("config", "", "load cluster settings from a JSON file (explicit flags override file values)")
 		clusterName = flag.String("name", "aegis", "cluster name")
 		k3sImage    = flag.String("image", "", "rancher/k3s node image (empty = pinned default)")
 		stateDir    = flag.String("state-dir", "_out/clusters", "cluster state directory (also holds state.json)")
@@ -44,6 +47,23 @@ func run() error {
 	)
 
 	flag.Parse()
+
+	// Apply config-file values for any flag the user did NOT set explicitly.
+	// flag.Visit visits only flags the caller actually provided, so we can
+	// distinguish "user passed -name foo" from "name kept its default".
+	if *configPath != "" {
+		fc, err := loadFileConfig(*configPath)
+		if err != nil {
+			return fmt.Errorf("config: %w", err)
+		}
+
+		explicit := make(map[string]bool)
+		flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
+		applyConfig(fc, explicit,
+			clusterName, k3sImage, stateDir, network, dnsDomain,
+			token, serverMemMB, agentMemMB, agentCount)
+	}
 
 	ctx := context.Background()
 
