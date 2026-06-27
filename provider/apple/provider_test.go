@@ -22,25 +22,38 @@ func agentNode(name string) NodeConfig {
 }
 
 // TestValidateClusterConfig_ServerCountBoundaries exercises the server-count boundary
-// (BVA, CLAUDE.md k): B = 1 server (the sqlite single-server case). B-1 = 0 rejected;
-// B = 1 accepted; B+1 = 2 rejected (multi-server needs embedded etcd, intentionally
-// disabled). Agent count is not the boundary — 0 agents (single-node) is valid.
+// (BVA, CLAUDE.md k), now gated on the datastore mode (docs/ADR/0002):
+//   - 0 servers              : always rejected (nothing owns the API).
+//   - 1 server               : always accepted (embedded sqlite OR external datastore).
+//   - 2 servers, no endpoint : rejected (multi-server sqlite impossible, etcd disabled).
+//   - 2 servers, endpoint set: accepted (HA on the shared external datastore).
+//
+// So B=1 is the ceiling ONLY without a datastore; with one, the ceiling lifts. Both sides
+// of the B+1 boundary (2 servers) are exercised — the datastore endpoint flips the verdict.
 func TestValidateClusterConfig_ServerCountBoundaries(t *testing.T) {
+	const ds = "postgres://kine:pw@db.aegis:5432/kine"
+
 	tests := []struct {
 		name    string
 		nodes   []NodeConfig
+		ds      string
+		managed bool
 		wantErr bool
 	}{
-		{"no nodes at all", nil, true},
-		{"0 servers, 1 agent (B-1, invalid)", []NodeConfig{agentNode("a1")}, true},
-		{"1 server, 0 agent (single-node, valid)", []NodeConfig{serverNode("s1")}, false},
-		{"1 server + 1 agent (smallest real, valid)", []NodeConfig{serverNode("s1"), agentNode("a1")}, false},
-		{"2 servers (B+1, invalid: sqlite single-server)", []NodeConfig{serverNode("s1"), serverNode("s2")}, true},
+		{"no nodes at all", nil, "", false, true},
+		{"0 servers, 1 agent (B-1, invalid)", []NodeConfig{agentNode("a1")}, "", false, true},
+		{"1 server, 0 agent (single-node sqlite, valid)", []NodeConfig{serverNode("s1")}, "", false, false},
+		{"1 server + 1 agent (smallest real, valid)", []NodeConfig{serverNode("s1"), agentNode("a1")}, "", false, false},
+		{"1 server + datastore (valid)", []NodeConfig{serverNode("s1")}, ds, false, false},
+		{"2 servers, no datastore (B+1, invalid)", []NodeConfig{serverNode("s1"), serverNode("s2")}, "", false, true},
+		{"2 servers + BYO datastore (B+1, HA valid)", []NodeConfig{serverNode("s1"), serverNode("s2")}, ds, false, false},
+		{"2 servers + managed datastore (B+1, HA valid)", []NodeConfig{serverNode("s1"), serverNode("s2")}, "", true, false},
+		{"3 servers + datastore (HA valid)", []NodeConfig{serverNode("s1"), serverNode("s2"), serverNode("s3")}, ds, false, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateClusterConfig(ClusterConfig{Name: "test", Nodes: tt.nodes})
+			err := validateClusterConfig(ClusterConfig{Name: "test", DatastoreEndpoint: tt.ds, ManageDatastore: tt.managed, Nodes: tt.nodes})
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("wantErr=%v, got err=%v", tt.wantErr, err)
 			}
@@ -132,6 +145,137 @@ func TestBuildRunArgs_ServerRecipe(t *testing.T) {
 	for _, c := range checks {
 		if !c.ok {
 			t.Errorf("server recipe check failed: %s\nargs: %s", c.desc, joined)
+		}
+	}
+}
+
+// TestBuildRunArgs_HAServerRecipe locks the HA server recipe: with an external datastore
+// endpoint set, a server emits --datastore-endpoint, covers BOTH its own FQDN and the shared
+// cluster API name in --tls-san, never uses --cluster-init (embedded etcd is disabled), and —
+// as a non-bootstrap server (no kubeconfig host dir) — emits no --write-kubeconfig. Mirrors
+// docs/ADR/0002.
+func TestBuildRunArgs_HAServerRecipe(t *testing.T) {
+	cfg := recipeCfg()
+	cfg.DatastoreEndpoint = "postgres://kine:pw@db.aegis:5432/kine"
+	node := NodeConfig{Name: "aegis-server-2", Role: RoleServer, Memory: 2048 * 1024 * 1024, NanoCPUs: 2e9}
+
+	// Non-bootstrap server: serverURL "" and kubeconfigHostDir "" (only the first server mounts it).
+	args := buildRunArgs(cfg, node, "", "aegis", "")
+	joined := strings.Join(args, " ")
+
+	checks := []struct {
+		ok   bool
+		desc string
+	}{
+		{slices.Contains(args, "--datastore-endpoint="+cfg.DatastoreEndpoint), "--datastore-endpoint carries the external datastore"},
+		{hasPair(args, "--tls-san", "aegis-server-2.aegis"), "--tls-san covers the server's own FQDN"},
+		{hasPair(args, "--tls-san", "aegis-api.aegis"), "--tls-san also covers the shared cluster API name (LB-ready cert)"},
+		{!strings.Contains(joined, "--cluster-init"), "NO --cluster-init (embedded etcd is intentionally disabled)"},
+		{!strings.Contains(joined, "--write-kubeconfig"), "non-bootstrap server emits no --write-kubeconfig (no host mount)"},
+		{slices.Contains(args, "--flannel-backend=host-gw"), "host-gw still set"},
+		{subcommandIs(args, cfg.Image, "server"), "server subcommand"},
+	}
+
+	for _, c := range checks {
+		if !c.ok {
+			t.Errorf("HA server recipe check failed: %s\nargs: %s", c.desc, joined)
+		}
+	}
+}
+
+// TestBuildRunArgs_SingleServerNoDatastoreFlag guards that the DEFAULT single-server recipe
+// (no datastore endpoint) is unchanged: no --datastore-endpoint, and no shared API SAN — only
+// the node's own FQDN. This keeps v0.1.x byte-compatible.
+func TestBuildRunArgs_SingleServerNoDatastoreFlag(t *testing.T) {
+	cfg := recipeCfg() // DatastoreEndpoint == ""
+	node := NodeConfig{Name: "aegis-server-1", Role: RoleServer, Memory: 2048 * 1024 * 1024}
+
+	args := buildRunArgs(cfg, node, "", "aegis", "/abs/state/aegis")
+	joined := strings.Join(args, " ")
+
+	if strings.Contains(joined, "--datastore-endpoint") {
+		t.Errorf("single-server must NOT emit --datastore-endpoint\nargs: %s", joined)
+	}
+
+	if hasPair(args, "--tls-san", "aegis-api.aegis") {
+		t.Errorf("single-server must NOT add the shared API SAN\nargs: %s", joined)
+	}
+}
+
+// TestBuildDatastoreRunArgs locks the managed Postgres datastore recipe (Phase B / G9):
+// correct image, POSTGRES_* env, the PGDATA subdir guard (ext4 named volume ships a
+// lost+found), the data named volume, the cluster labels (so the destroy sweep reclaims it),
+// the FQDN --name — and crucially NONE of the k3s recipe (no --cap-add ALL, no tmpfs, no k3s
+// subcommand; the image is the final arg).
+func TestBuildDatastoreRunArgs(t *testing.T) {
+	cfg := recipeCfg()
+	args := buildDatastoreRunArgs(cfg, "s3cr3t", "aegis")
+	joined := strings.Join(args, " ")
+
+	checks := []struct {
+		ok   bool
+		desc string
+	}{
+		{hasPair(args, "--name", "aegis-db.aegis"), "--name is the datastore FQDN"},
+		{hasPair(args, "--env", "POSTGRES_USER=kine"), "POSTGRES_USER=kine"},
+		{hasPair(args, "--env", "POSTGRES_PASSWORD=s3cr3t"), "POSTGRES_PASSWORD set from the generated password"},
+		{hasPair(args, "--env", "POSTGRES_DB=kine"), "POSTGRES_DB=kine"},
+		{hasPair(args, "--env", "PGDATA="+datastorePGDataDir), "PGDATA points at a subdir (lost+found guard, G9)"},
+		{hasPair(args, "--volume", datastoreVolumeName("aegis")+":"+datastoreDataMount), "Postgres data on the named volume"},
+		{hasPair(args, "--label", "k3s.cluster.name=aegis"), "cluster label (destroy sweep reclaims it)"},
+		{hasPair(args, "--label", "k3s.role=datastore"), "role=datastore label"},
+		{hasPair(args, "--label", "k3s.owned=true"), "owned label"},
+		{!strings.Contains(joined, "--cap-add"), "NO --cap-add (postgres is not k3s)"},
+		{!tmpfsContains(args, "/run") && !tmpfsContains(args, "/tmp"), "NO tmpfs (not a k3s node)"},
+		{!strings.Contains(joined, "server") && !strings.Contains(joined, "agent"), "NO k3s subcommand"},
+		{args[len(args)-1] == defaultDatastoreImage, "image is the final arg (no trailing subcommand)"},
+	}
+
+	for _, c := range checks {
+		if !c.ok {
+			t.Errorf("datastore recipe check failed: %s\nargs: %s", c.desc, joined)
+		}
+	}
+}
+
+// TestDatastoreHelpers locks the datastore naming + endpoint derivation, the single source of
+// truth shared by buildDatastoreRunArgs (create) and destroyRecordedNodes (teardown).
+func TestDatastoreHelpers(t *testing.T) {
+	if got := datastoreNodeName("aegis"); got != "aegis-db" {
+		t.Errorf("datastoreNodeName: got %q, want aegis-db", got)
+	}
+
+	if got := datastoreVolumeName("aegis"); got != "aegis-db-pg" {
+		t.Errorf("datastoreVolumeName: got %q, want aegis-db-pg", got)
+	}
+
+	want := "postgres://kine:pw123@aegis-db.aegis:5432/kine?sslmode=disable"
+	if got := datastoreEndpointURL("aegis", "aegis", "pw123"); got != want {
+		t.Errorf("datastoreEndpointURL:\n got %q\nwant %q", got, want)
+	}
+}
+
+// TestEnsureRemovable guards that -remove-node refuses both a server and the managed datastore
+// (cluster-destroying acts) and permits an agent.
+func TestEnsureRemovable(t *testing.T) {
+	if err := ensureRemovable(NodeInfo{Name: "s1", Role: RoleServer}); err == nil {
+		t.Error("removing a server must be refused")
+	}
+
+	if err := ensureRemovable(NodeInfo{Name: "aegis-db", Role: RoleDatastore}); err == nil {
+		t.Error("removing the datastore must be refused")
+	}
+
+	if err := ensureRemovable(NodeInfo{Name: "a1", Role: RoleAgent}); err != nil {
+		t.Errorf("removing an agent must be allowed, got %v", err)
+	}
+}
+
+// TestRoleString locks the role rendering, including the datastore role used only as a label.
+func TestRoleString(t *testing.T) {
+	for role, want := range map[Role]string{RoleServer: "server", RoleAgent: "agent", RoleDatastore: "datastore"} {
+		if got := role.String(); got != want {
+			t.Errorf("Role(%d).String(): got %q, want %q", role, got, want)
 		}
 	}
 }

@@ -18,16 +18,24 @@ const (
 	RoleServer Role = iota
 	// RoleAgent is a k3s agent node (worker; joins via K3S_URL + K3S_TOKEN).
 	RoleAgent
+	// RoleDatastore is the managed external datastore (Postgres) micro-VM that backs an HA
+	// control plane (docs/ADR/0002). It is NOT a k3s node: it never goes through buildRunArgs
+	// or the k3s subcommand path. It is provisioned by Create when ManageDatastore is set and
+	// tracked in ClusterState.Nodes so the teardown label sweep reclaims it.
+	RoleDatastore
 )
 
-// String renders the role as the k3s subcommand string ("server" / "agent"), which
-// is exactly what gets appended to `container run ... <image> <role>`.
+// String renders the role. For server/agent it is the k3s subcommand appended to
+// `container run ... <image> <role>`; "datastore" is a label value only (a RoleDatastore
+// node never reaches the k3s subcommand path).
 func (r Role) String() string {
 	switch r {
 	case RoleServer:
 		return "server"
 	case RoleAgent:
 		return "agent"
+	case RoleDatastore:
+		return "datastore"
 	default:
 		return "unknown"
 	}
@@ -56,7 +64,22 @@ type ClusterConfig struct {
 	StateDir string
 	// Token is the shared K3S_TOKEN. Generated with crypto/rand if empty (see token.go).
 	Token string
-	// Nodes are the nodes to launch (server first is enforced by Create's ordering).
+	// DatastoreEndpoint, when non-empty, is the k3s --datastore-endpoint for an EXTERNAL
+	// network datastore (e.g. postgres://user:pass@db.aegis:5432/kine). It switches the
+	// cluster into multi-server HA mode: every server runs stateless against this shared
+	// datastore — no embedded etcd (etcd's IP-bound peer membership cannot survive the
+	// vmnet DHCP IP shift; see docs/ADR/0002). Empty = single-server embedded sqlite
+	// (v0.1.x), UNLESS ManageDatastore asks Create to provision one. validateClusterConfig
+	// requires either this or ManageDatastore whenever Nodes has >1 server.
+	DatastoreEndpoint string
+	// ManageDatastore asks Create to provision a managed Postgres datastore micro-VM (the
+	// one-command HA path) and fill DatastoreEndpoint automatically. Requires a DNS domain
+	// (HA needs a stable FQDN for the datastore endpoint). Ignored when DatastoreEndpoint is
+	// already set (bring-your-own datastore). The managed node's image and memory are fixed
+	// defaults (see node.go defaultDatastoreImage / defaultDatastoreMemoryBytes).
+	ManageDatastore bool
+	// Nodes are the nodes to launch (server first is enforced by Create's ordering). The
+	// managed datastore is NOT listed here — Create provisions it separately.
 	Nodes []NodeConfig
 }
 
@@ -82,7 +105,11 @@ type ClusterState struct {
 	// launches new agents on the exact same image as the original nodes. Pre-v0.2.0
 	// states predate this field and unmarshal to ""; AddAgents falls back to
 	// defaultK3sImage in that case.
-	Image     string     `json:"image"`
-	ServerURL string     `json:"serverURL"` // https://<server-fqdn>:6443 (FQDN or IP)
-	Nodes     []NodeInfo `json:"nodes"`
+	Image string `json:"image"`
+	// DatastoreEndpoint is the external --datastore-endpoint the cluster runs on, recorded
+	// for visibility and so HA context survives in state.json. Empty for single-server
+	// sqlite clusters; pre-v0.2.0 states omit the field and unmarshal to "".
+	DatastoreEndpoint string     `json:"datastoreEndpoint,omitempty"`
+	ServerURL         string     `json:"serverURL"` // https://<server-fqdn>:6443 (FQDN or IP)
+	Nodes             []NodeInfo `json:"nodes"`
 }

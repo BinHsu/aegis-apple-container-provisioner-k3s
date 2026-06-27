@@ -18,13 +18,20 @@ import (
 // All other fields treat the JSON zero value ("", 0) as "not specified";
 // see applyConfig for the full precedence rules and the Agents special case.
 type fileConfig struct {
-	Name           string  `json:"name"`
-	DNSDomain      *string `json:"dnsDomain"` // nil = absent; non-nil "" = IP-only mode
-	Image          string  `json:"image"`
-	Network        string  `json:"network"`
-	Token          string  `json:"token"`
-	ServerMemoryMB int64   `json:"serverMemoryMB"`
-	AgentMemoryMB  int64   `json:"agentMemoryMB"`
+	Name      string  `json:"name"`
+	DNSDomain *string `json:"dnsDomain"` // nil = absent; non-nil "" = IP-only mode
+	Image     string  `json:"image"`
+	Network   string  `json:"network"`
+	Token     string  `json:"token"`
+	// DatastoreEndpoint enables multi-server HA (external datastore; see docs/ADR/0002).
+	// "" = absent → single-server embedded sqlite.
+	DatastoreEndpoint string `json:"datastoreEndpoint"`
+	ServerMemoryMB    int64  `json:"serverMemoryMB"`
+	AgentMemoryMB     int64  `json:"agentMemoryMB"`
+	// Servers: control-plane node count. Unlike Agents, 0 is NOT a valid shape (a cluster
+	// needs at least one server), so absent-from-file (0) leaves the built-in default (1)
+	// in place — see applyConfig. Set "servers": N (with "datastoreEndpoint") for HA.
+	Servers int `json:"servers"`
 	// Agents: 0 is a valid cluster shape (single-server, no agents). A plain int
 	// cannot distinguish absent-from-file vs explicitly-zero in JSON — see applyConfig.
 	Agents   int    `json:"agents"`
@@ -73,7 +80,8 @@ func loadFileConfig(path string) (fileConfig, error) {
 func applyConfig(
 	fc fileConfig, explicit map[string]bool,
 	clusterName *string, k3sImage *string, stateDir *string, network *string,
-	dnsDomain *string, token *string, serverMemMB *int64, agentMemMB *int64, agentCount *int,
+	dnsDomain *string, token *string, datastore *string,
+	serverMemMB *int64, agentMemMB *int64, serverCount *int, agentCount *int,
 ) {
 	if !explicit["name"] && fc.Name != "" {
 		*clusterName = fc.Name
@@ -96,12 +104,22 @@ func applyConfig(
 		*token = fc.Token
 	}
 
+	if !explicit["datastore-endpoint"] && fc.DatastoreEndpoint != "" {
+		*datastore = fc.DatastoreEndpoint
+	}
+
 	if !explicit["server-memory"] && fc.ServerMemoryMB != 0 {
 		*serverMemMB = fc.ServerMemoryMB
 	}
 
 	if !explicit["agent-memory"] && fc.AgentMemoryMB != 0 {
 		*agentMemMB = fc.AgentMemoryMB
+	}
+
+	// Servers: 0 is NOT a valid cluster shape, so (unlike Agents) absent-from-file (0)
+	// leaves the built-in default (1) in place rather than overriding it to 0.
+	if !explicit["servers"] && fc.Servers != 0 {
+		*serverCount = fc.Servers
 	}
 
 	// Agents: always apply from file (even 0) unless the flag was explicitly set.

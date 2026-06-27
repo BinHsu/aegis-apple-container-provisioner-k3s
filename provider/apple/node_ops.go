@@ -241,12 +241,20 @@ func nextAgentIndex(nodes []NodeInfo, clusterName string) int {
 	return highest + 1
 }
 
-// ensureRemovable is the server-removal guard, extracted from RemoveNode so the decision
-// is unit-testable without any container calls. A server node may not be removed: it owns
-// the datastore and API, so removing it destroys the cluster — that is the -destroy path.
+// ensureRemovable is the node-removal guard, extracted from RemoveNode so the decision is
+// unit-testable without any container calls. Two roles may not be removed via -remove-node:
+//   - a server owns the API (and, in single-server mode, the datastore);
+//   - the managed datastore backs the whole control plane.
+//
+// Removing either is a cluster-destroying act, so it belongs to -destroy. Agents are the only
+// removable role. (Removing one of several HA servers is conservatively refused too: the
+// kubeconfig endpoint targets the bootstrap server and there is no API LB yet — docs/ADR/0002.)
 func ensureRemovable(node NodeInfo) error {
-	if node.Role == RoleServer {
-		return fmt.Errorf("node %q is the cluster server; removing it would destroy the cluster — use -destroy instead", node.Name)
+	switch node.Role {
+	case RoleServer:
+		return fmt.Errorf("node %q is a cluster server; removing it would break the control plane — use -destroy instead", node.Name)
+	case RoleDatastore:
+		return fmt.Errorf("node %q is the cluster datastore; removing it would destroy the cluster — use -destroy instead", node.Name)
 	}
 
 	return nil

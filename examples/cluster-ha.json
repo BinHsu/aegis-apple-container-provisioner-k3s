@@ -1,0 +1,11 @@
+{
+  "name": "hav",
+  "dnsDomain": "aegis",
+  "image": "rancher/k3s:v1.32.5-k3s1",
+  "network": "default",
+  "serverMemoryMB": 1536,
+  "agentMemoryMB": 1536,
+  "servers": 2,
+  "agents": 1,
+  "stateDir": "_out/clusters"
+}

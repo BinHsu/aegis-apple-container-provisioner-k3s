@@ -40,10 +40,14 @@ func run() error {
 		token       = flag.String("token", "", "K3S_TOKEN (empty = generate with crypto/rand)")
 		serverMemMB = flag.Int64("server-memory", 2048, "server memory (MB)")
 		agentMemMB  = flag.Int64("agent-memory", 2048, "agent memory (MB)")
-		agentCount  = flag.Int("agents", 1, "number of agent (worker) nodes")
-		destroy     = flag.Bool("destroy", false, "destroy the named cluster instead of creating it")
-		addAgents   = flag.Int("add-agents", 0, "add N agent nodes to an existing cluster")
-		removeNode  = flag.String("remove-node", "", "remove a node (by name) from an existing cluster")
+		serverCount = flag.Int("servers", 1, "number of server (control-plane) nodes (HA, see docs/ADR/0002). "+
+			">1 with no -datastore-endpoint makes k3ac provision a managed Postgres datastore (needs -dns-domain).")
+		datastore = flag.String("datastore-endpoint", "", "bring-your-own external k3s datastore for HA, e.g. "+
+			"postgres://user:pass@db.aegis:5432/kine. Empty + -servers>1 = k3ac provisions one; empty + -servers=1 = embedded sqlite.")
+		agentCount = flag.Int("agents", 1, "number of agent (worker) nodes")
+		destroy    = flag.Bool("destroy", false, "destroy the named cluster instead of creating it")
+		addAgents  = flag.Int("add-agents", 0, "add N agent nodes to an existing cluster")
+		removeNode = flag.String("remove-node", "", "remove a node (by name) from an existing cluster")
 	)
 
 	flag.Parse()
@@ -62,7 +66,7 @@ func run() error {
 
 		applyConfig(fc, explicit,
 			clusterName, k3sImage, stateDir, network, dnsDomain,
-			token, serverMemMB, agentMemMB, agentCount)
+			token, datastore, serverMemMB, agentMemMB, serverCount, agentCount)
 	}
 
 	ctx := context.Background()
@@ -123,15 +127,18 @@ func run() error {
 		return nil
 	}
 
-	// NOTE: exactly one server is supported (sqlite single-server; see the launcher's
-	// validateClusterConfig). The driver hard-codes one server and N agents.
-	nodes := []apple.NodeConfig{
-		{
-			Name:     fmt.Sprintf("%s-server-1", *clusterName),
+	// Build the node set: N servers then N agents. One server (default) is embedded-sqlite
+	// single-server (v0.1.x). More than one server requires -datastore-endpoint; the
+	// launcher's validateClusterConfig enforces that and is the single source of truth.
+	var nodes []apple.NodeConfig
+
+	for i := range *serverCount {
+		nodes = append(nodes, apple.NodeConfig{
+			Name:     fmt.Sprintf("%s-server-%d", *clusterName, i+1),
 			Role:     apple.RoleServer,
 			Memory:   *serverMemMB * mib,
 			NanoCPUs: 2e9,
-		},
+		})
 	}
 
 	for i := range *agentCount {
@@ -144,12 +151,18 @@ func run() error {
 	}
 
 	cfg := apple.ClusterConfig{
-		Name:     *clusterName,
-		Image:    *k3sImage,
-		Network:  *network,
-		StateDir: *stateDir,
-		Token:    *token,
-		Nodes:    nodes,
+		Name:              *clusterName,
+		Image:             *k3sImage,
+		Network:           *network,
+		StateDir:          *stateDir,
+		Token:             *token,
+		DatastoreEndpoint: *datastore,
+		// Infer managed-datastore (one-command HA): more than one server and no bring-your-own
+		// endpoint means k3ac provisions a Postgres datastore itself. With an explicit
+		// -datastore-endpoint the operator owns the datastore (BYO). The provider validates the
+		// rest (e.g. managed HA needs -dns-domain).
+		ManageDatastore: *serverCount > 1 && *datastore == "",
+		Nodes:           nodes,
 	}
 
 	state, err := prov.Create(ctx, cfg, log.Writer())

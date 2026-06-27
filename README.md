@@ -2,24 +2,31 @@
 
 A standalone launcher that boots k3s clusters as Apple Silicon micro-VMs via Apple's [`container`](https://github.com/apple/container) tool — **NOT** a k3s upstream provider interface (k3s has none).
 
-> **Status: v0.1.0 — all hardware gates GREEN (2026-06-27).** G1–G7 verified on Apple
-> Silicon with `container` 1.0.0 and `rancher/k3s:v1.32.5-k3s1`: k3s boots under `vminitd`,
-> multi-node `host-gw` networking, named-volume sqlite persistence across cold restart,
-> host-side readiness + bind-mount kubeconfig delivery (no `container cp`), FQDN endpoint
-> survives cold-restart IP changes, real workload + Traefik ingress, and no-hang teardown.
-> A forker clean-room run (the documented commands, from zero) reproduced the full lifecycle.
-> See [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for the first-person runbook and
+> **Status: v0.2.0 — all hardware gates GREEN (2026-06-27).** G1–G7 (v0.1.0) plus G8
+> (node add/remove), G9 (HA external-datastore cold-restart survival), and G10 (one-command
+> HA end to end) verified on Apple Silicon with `container` 1.0.0 and
+> `rancher/k3s:v1.32.5-k3s1`: k3s boots under `vminitd`, multi-node `host-gw` networking,
+> named-volume sqlite persistence across cold restart, host-side readiness + bind-mount
+> kubeconfig delivery (no `container cp`), FQDN endpoint survives cold-restart IP changes,
+> real workload + Traefik ingress, no-hang teardown, live membership ops, and a
+> **multi-server HA control plane on a managed external datastore**.
+> See [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for the first-person runbook,
 > [`docs/ADR/0001-kubeconfig-delivery-via-host-bind-mount.md`](docs/ADR/0001-kubeconfig-delivery-via-host-bind-mount.md)
-> for the kubeconfig-delivery design.
+> for kubeconfig delivery, and
+> [`docs/ADR/0002-ha-via-external-datastore-not-embedded-etcd.md`](docs/ADR/0002-ha-via-external-datastore-not-embedded-etcd.md)
+> for the HA design.
 
 ## What it is (and isn't)
 
-- **Is:** a stdlib-only Go launcher that execs the `container` CLI to boot a single-server
-  k3s cluster (1 server + N agents) as per-node micro-VMs, then tears it down. The
+- **Is:** a stdlib-only Go launcher that execs the `container` CLI to boot a k3s cluster as
+  per-node micro-VMs, then tears it down. Single-server embedded sqlite by default; an opt-in
+  **multi-server HA control plane** on an external datastore (`-servers N`, see below). The
   exec-the-CLI pattern is carried over verbatim from the Talos sibling.
 - **Isn't:** an implementation of any upstream interface. The Talos sibling satisfies
   `siderolabs/talos/pkg/provision.Provisioner`; **k3s has no equivalent pluggable
-  provisioner**, so this is a freestanding launcher with no upstream merge path.
+  provisioner**, so this is a freestanding launcher with no upstream merge path. The HA
+  *control plane* is highly available; the managed datastore is a single Postgres VM (not
+  itself replicated) — see ADR-0002.
 
 ## Sibling relationship
 
@@ -33,7 +40,7 @@ key recipe deltas from Talos:
 | Caps | `--cap-add ALL` | `--cap-add ALL` (same; k3s embedded containerd needs CAP_SYS_ADMIN) |
 | tmpfs set | `/run /system /tmp` + overlays, NOT `/opt` | **only `/run` and `/tmp`** — `/var` is NOT tmpfs (named-volume datastore) |
 | Datastore | Named volumes `/var` + `/system/state` | Named volume `<cluster>-<node>-k3s:/var/lib/rancher/k3s` (one per node) |
-| Datastore engine | etcd | **sqlite single-server** — `--cluster-init` deliberately OFF |
+| Datastore engine | etcd | **sqlite single-server** (default), or **external Postgres for N-server HA** (`-servers N`) — embedded etcd / `--cluster-init` deliberately OFF (IP-bound; see ADR-0002) |
 | Networking | flannel via machine config | `--flannel-backend=host-gw` + `--tls-san <server-fqdn>` |
 | Endpoint | FQDN via `-dns-domain` | FQDN via `-dns-domain` (same pattern, mirrored from v0.2.0) |
 | Memory unit | `MB` suffix | `MB` suffix (carried over) |
@@ -74,13 +81,46 @@ To disable FQDN naming and fall back to IP-based naming (v0.1.x behaviour):
 go run ./cmd/k3ac -dns-domain "" -name aegis -agents 1
 ```
 
+## High availability (`-servers N`)
+
+By default the cluster is one server on embedded sqlite. Pass `-servers N` (N≥2) for an HA
+control plane: every server runs **stateless against a shared external datastore** — there is
+no embedded etcd. With no `-datastore-endpoint`, k3ac **provisions a managed Postgres datastore
+micro-VM itself** (one command):
+
+```sh
+# Two servers + one agent; k3ac provisions hav-db.aegis (Postgres) and wires both servers to it:
+go run ./cmd/k3ac -name hav -servers 2 -agents 1
+```
+
+Or bring your own datastore (Postgres, MySQL/MariaDB, or external etcd):
+
+```sh
+go run ./cmd/k3ac -name hav -servers 2 \
+  -datastore-endpoint 'postgres://kine:pw@db.aegis:5432/kine'
+```
+
+**Why external datastore, not embedded etcd:** etcd's peer membership is IP-bound and cannot
+reform quorum after the vmnet DHCP IP shift a cold restart causes — verified dead on this
+substrate. An external datastore addressed by FQDN has no IP-bound membership, so the control
+plane reconnects by name and survives the shift (verified, G9/G10). See
+[`docs/ADR/0002-ha-via-external-datastore-not-embedded-etcd.md`](docs/ADR/0002-ha-via-external-datastore-not-embedded-etcd.md).
+
+**Scope:** managed HA requires `-dns-domain` (the datastore is reached by FQDN). The *control
+plane* is HA; the managed datastore is a single Postgres VM (not replicated) — datastore HA is
+future work. Datastore TLS is not yet provisioned (`sslmode=disable` on the private vmnet).
+A shared API load balancer is not yet wired, so the kubeconfig endpoint targets the first
+server (the cert already covers a shared `<cluster>-api.<domain>` SAN for when an LB lands).
+
 ## Lifecycle
 
 ```
 validate → ensureNetwork → DNS domain precheck
+  → [HA only] provision managed Postgres datastore (FQDN <cluster>-db) → wire --datastore-endpoint
   → prepareNodeVolumes (create named volumes, stale-state guard)
-  → launch SERVER (sqlite + host-gw + tls-san=<server-fqdn> + K3S_TOKEN)
+  → launch BOOTSTRAP server (host-gw + tls-san=<server-fqdn> + K3S_TOKEN; sqlite, or --datastore-endpoint when HA)
   → waitForIPv4 → exec sysctl ip_forward=1 → TLS dial https://<server-fqdn>:6443 (readiness) → os.Stat /mnt/k3s-out/k3s.yaml via bind-mount (kubeconfig delivery)
+  → [HA only] launch each ADDITIONAL server against the shared datastore (no --cluster-init)
   → launch each AGENT (K3S_URL=https://<server-fqdn>:6443 + K3S_TOKEN)
   → waitForIPv4 → exec sysctl → saveState
 ```
@@ -155,7 +195,10 @@ go run ./cmd/k3ac -name aegis -agents 1 -dns-domain myk3s
 # Create in IP-only mode (no FQDN, no DNS prereq):
 go run ./cmd/k3ac -name aegis -agents 1 -dns-domain ""
 
-# Tear it down (removes nodes, named volumes, network, state):
+# Create an HA control plane: 2 servers on a managed Postgres datastore + 1 agent (one command):
+go run ./cmd/k3ac -name hav -servers 2 -agents 1
+
+# Tear it down (removes nodes — datastore included — named volumes, network, state):
 go run ./cmd/k3ac -name aegis -destroy
 
 # Grow / shrink a running cluster (membership ops — no recreate):
@@ -174,8 +217,11 @@ go run ./cmd/k3ac -config examples/cluster.json -agents 3    # file, but overrid
 ```
 
 Unknown keys are rejected (a typo like `serverMemoryMb` fails fast rather than being
-ignored). See [`examples/cluster.json`](examples/cluster.json). Note: because JSON cannot
-distinguish an absent `agents` key from `"agents": 0`, always declare `agents` in the file.
+ignored). See [`examples/cluster.json`](examples/cluster.json) (single-server) and
+[`examples/cluster-ha.json`](examples/cluster-ha.json) (`"servers": 2` → managed-HA). Note:
+because JSON cannot distinguish an absent `agents` key from `"agents": 0`, always declare
+`agents` in the file. (`servers` is the opposite: absent → the default `1`, since 0 servers
+is never valid.)
 
 ### Smoke test (optional — prove the cluster actually serves traffic)
 
@@ -198,6 +244,8 @@ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: nope.local' http://${NODE_IP}
 |---|---|---|
 | `-name` | `aegis` | Cluster name (also the label value and state-dir key) |
 | `-dns-domain` | `aegis` | Apple container DNS domain for FQDN node names; `""` = IP-only fallback |
+| `-servers` | `1` | Number of server (control-plane) nodes. `>1` = HA; with no `-datastore-endpoint` k3ac provisions a managed Postgres datastore (needs `-dns-domain`) |
+| `-datastore-endpoint` | `""` | Bring-your-own external datastore for HA (e.g. `postgres://…`). Empty + `-servers>1` = k3ac provisions one; empty + `-servers=1` = embedded sqlite |
 | `-agents` | `1` | Number of agent (worker) nodes |
 | `-image` | pinned | `rancher/k3s` image tag (empty = `rancher/k3s:v1.32.5-k3s1`) |
 | `-token` | random | K3S_TOKEN (empty = generated with `crypto/rand`) |
@@ -236,6 +284,9 @@ All green on Apple Silicon, `container` 1.0.0, `rancher/k3s:v1.32.5-k3s1` — se
 - **G5** — FQDN endpoint survives a cold restart on a new DHCP IP (zero re-point)
 - **G6** — real workload (nginx) + built-in Traefik ingress, host-reachable (200 / 404)
 - **G7** — teardown via both `state.json` and label-sweep paths, no daemon hang (~1 s)
+- **G8** — node membership: add/remove agents on a running cluster (server removal refused)
+- **G9** — HA external-datastore: 2 servers survive a cold-restart DHCP IP shift (spike behind ADR-0002)
+- **G10** — `k3ac -servers 2` one-command HA end to end: managed Postgres + 2 servers, cold-restart survival, clean teardown
 
 ## Requirements
 
