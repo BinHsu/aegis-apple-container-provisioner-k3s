@@ -121,6 +121,61 @@ func clusterConfigFromState(state ClusterState, stateDir, clusterDir string) Clu
 	}
 }
 
+// k3s serving-cert files that bind to a node's IP and therefore go STALE when a recreate boots the
+// node on a new DHCP IP. Clearing them forces k3s to regenerate each with the node's CURRENT IP in
+// the SANs on next start. These are SERVING certs only — never the cluster CA (server-ca / client-ca
+// / request-header-ca / etcd CA, which live in the external datastore and are the cluster's root of
+// trust) and never the client/identity certs (signed by those CAs, not IP-bound). The FQDN --tls-san
+// stays valid throughout, so the API LB endpoint never breaks; only the per-node IP SANs are refreshed.
+const (
+	// k3sDynamicCertFile caches the apiserver/supervisor (:6443) dynamiclistener serving cert on a
+	// SERVER. Deleting it makes the recreated server mint a fresh boot cert covering its new IP, so the
+	// inter-node remotedialer dial (wss://<new-ip>:6443) verifies. The cert is also persisted in the
+	// k3s-serving secret in the datastore, but that copy self-heals once the apiserver is up and adds
+	// the node's own IP to the SAN union; clearing the LOCAL cache is what gets a valid cert served at
+	// boot, sidestepping the secret-can't-renew-before-apiserver-is-up deadlock (k3s-io/k3s#12475).
+	k3sDynamicCertFile = k3sDatastoreMount + "/server/tls/dynamic-cert.json"
+	// k3sKubeletServingCert / Key are the kubelet's HTTPS serving cert (:10250), IP-bound via its SANs
+	// and present on BOTH servers and agents (every k3s node runs a kubelet). Deleting them makes the
+	// node re-request a freshly server-CA-signed kubelet serving cert carrying its new IP, so
+	// apiserver->kubelet traffic (kubectl logs/exec, metrics-server) verifies. The signing CA is
+	// untouched — only the leaf serving cert is regenerated.
+	k3sKubeletServingCert = k3sDatastoreMount + "/agent/serving-kubelet.crt"
+	k3sKubeletServingKey  = k3sDatastoreMount + "/agent/serving-kubelet.key"
+)
+
+// staleServingCertPaths returns the IP-bound serving-cert files a recreate must clear for role, so
+// the recreated container regenerates them for its new DHCP IP. A SERVER clears the apiserver
+// dynamiclistener cache AND its kubelet serving cert; an AGENT clears only the kubelet serving cert
+// (it runs no apiserver). The non-k3s roles (RoleDatastore, RoleLB) have no k3s serving certs and get
+// nil — recreateK3sNode then runs no exec for them. Pure so the role gating + path list is
+// unit-testable (BVA, CLAUDE.md k).
+func staleServingCertPaths(role Role) []string {
+	switch role {
+	case RoleServer:
+		return []string{k3sDynamicCertFile, k3sKubeletServingCert, k3sKubeletServingKey}
+	case RoleAgent:
+		return []string{k3sKubeletServingCert, k3sKubeletServingKey}
+	default:
+		return nil
+	}
+}
+
+// rmStaleServingCertsArgs builds the `rm -f <path>...` argv that clears role's stale serving certs
+// inside the still-running container (via `container exec`). `rm` is NOT a k3s multi-call symlink, so
+// exec dispatches it cleanly — the container.go exec footgun applies only to k3s subcommands (kubectl/
+// crictl), and `rm` passes the same way `sysctl` does. `-f` keeps it idempotent: a missing file is not
+// an error, so a retry after a partial recreate is safe. Returns nil when role has no serving certs to
+// clear, signalling recreateK3sNode to skip the exec entirely. Pure (BVA, CLAUDE.md k).
+func rmStaleServingCertsArgs(role Role) []string {
+	paths := staleServingCertPaths(role)
+	if len(paths) == 0 {
+		return nil
+	}
+
+	return append([]string{"rm", "-f"}, paths...)
+}
+
 // recreateK3sNode stops and removes a k3s node's CONTAINER (its named state volume is left intact —
 // rm targets the container only, and buildRunArgs re-derives the same volume name from the bare node
 // name) and relaunches it from cfg, then re-arms ip_forward. This is the shared primitive behind a
@@ -137,6 +192,21 @@ func (p *provisioner) recreateK3sNode(ctx context.Context, cfg ClusterConfig, no
 	id := nodeFQDN(node.Name, p.dnsDomain)
 
 	fmt.Fprintln(logw, "recreating k3s node", node.Name)
+
+	// A recreate boots the node on a NEW DHCP IP, but its PRESERVED state volume still holds the
+	// serving certs minted for the OLD IP (the apiserver dynamiclistener cache on a server, the kubelet
+	// serving cert on every k3s node). Clear them on the STILL-RUNNING old container BEFORE stop: exec
+	// needs the container up, and the volume.img is ext4 — not host-editable — so a `container exec rm`
+	// is the only way in. The recreated container then regenerates each cert for its new IP. Without
+	// this a recreated server serves a cert lacking its new IP and the inter-node remotedialer fails
+	// x509 ("certificate is valid for ..., not <new-ip>"), so the cluster never reconverges. CA and
+	// client/identity certs are deliberately left intact (staleServingCertPaths returns serving certs
+	// only). No-op argv (nil) for non-k3s roles, so this never execs into a datastore/LB container.
+	if args := rmStaleServingCertsArgs(node.Role); args != nil {
+		if _, err := p.exec(ctx, id, args...); err != nil {
+			return NodeInfo{}, fmt.Errorf("clearing stale serving certs on node %q for recreate: %w", node.Name, err)
+		}
+	}
 
 	if err := p.stop(ctx, id); err != nil {
 		return NodeInfo{}, fmt.Errorf("stopping node %q for recreate: %w", node.Name, err)

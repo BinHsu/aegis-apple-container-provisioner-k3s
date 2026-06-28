@@ -452,3 +452,98 @@ func TestEtcdClusterToken(t *testing.T) {
 		t.Errorf("etcdClusterToken = %q, want aegis-etcd", got)
 	}
 }
+
+// --- v0.6.0 recreate layer 2: stale IP-bound serving certs ---
+
+// TestStaleServingCertPaths is the BVA on the role gate that decides WHICH serving certs a recreate
+// clears. A recreate boots the node on a new DHCP IP, so the IP-bound SERVING certs on the preserved
+// volume must be regenerated — but the cluster CA and client/identity certs must NOT. Boundaries: a
+// SERVER (apiserver dynamiclistener cache + kubelet serving cert), an AGENT (kubelet serving cert
+// only, no apiserver), and the two NON-k3s roles (datastore/LB → nothing to clear).
+func TestStaleServingCertPaths(t *testing.T) {
+	t.Run("server clears the dynamiclistener cache AND its kubelet serving cert", func(t *testing.T) {
+		got := staleServingCertPaths(RoleServer)
+
+		want := []string{
+			"/var/lib/rancher/k3s/server/tls/dynamic-cert.json",
+			"/var/lib/rancher/k3s/agent/serving-kubelet.crt",
+			"/var/lib/rancher/k3s/agent/serving-kubelet.key",
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("server serving certs:\n got %v\nwant %v", got, want)
+		}
+	})
+
+	t.Run("agent clears only the kubelet serving cert (no apiserver, no dynamic-cert.json)", func(t *testing.T) {
+		got := staleServingCertPaths(RoleAgent)
+
+		want := []string{
+			"/var/lib/rancher/k3s/agent/serving-kubelet.crt",
+			"/var/lib/rancher/k3s/agent/serving-kubelet.key",
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("agent serving certs:\n got %v\nwant %v", got, want)
+		}
+
+		for _, p := range got {
+			if strings.Contains(p, "dynamic-cert.json") {
+				t.Errorf("an agent has no apiserver dynamiclistener cache to clear: %v", got)
+			}
+		}
+	})
+
+	t.Run("non-k3s roles clear nothing", func(t *testing.T) {
+		for _, role := range []Role{RoleDatastore, RoleLB} {
+			if got := staleServingCertPaths(role); got != nil {
+				t.Errorf("role %v is not a k3s node and must clear no serving certs, got %v", role, got)
+			}
+		}
+	})
+
+	t.Run("never clears the cluster CA or any client/identity cert", func(t *testing.T) {
+		// The cluster's root of trust + identity certs live on the same volume; clearing any of them
+		// would break trust cluster-wide. Every cleared path must be a SERVING leaf only.
+		forbidden := []string{
+			"server-ca", "client-ca", "request-header-ca", "peer-ca", "etcd/", // CAs
+			"service.key",                                                                                // service-account signing key
+			"client-admin", "client-kubelet.crt", "client-controller", "client-k3s", "client-kube-proxy", // client identity
+		}
+
+		for _, role := range []Role{RoleServer, RoleAgent} {
+			for _, p := range staleServingCertPaths(role) {
+				for _, bad := range forbidden {
+					if strings.Contains(p, bad) {
+						t.Errorf("role %v would clear a CA/identity cert %q (matched %q) — only serving certs are safe", role, p, bad)
+					}
+				}
+			}
+		}
+	})
+}
+
+// TestRmStaleServingCertsArgs locks the `container exec` argv that clears the stale serving certs: it
+// is `rm -f <path>...` (idempotent, and `rm` is not a k3s multi-call symlink so exec dispatches it
+// cleanly), and it is nil for the non-k3s roles so recreateK3sNode skips the exec entirely.
+func TestRmStaleServingCertsArgs(t *testing.T) {
+	t.Run("k3s roles build rm -f with every serving-cert path", func(t *testing.T) {
+		for _, role := range []Role{RoleServer, RoleAgent} {
+			args := rmStaleServingCertsArgs(role)
+
+			if len(args) < 3 || args[0] != "rm" || args[1] != "-f" {
+				t.Fatalf("role %v: must start `rm -f`, got %v", role, args)
+			}
+
+			if !slices.Equal(args[2:], staleServingCertPaths(role)) {
+				t.Errorf("role %v: argv tail must be exactly the cert paths: %v", role, args)
+			}
+		}
+	})
+
+	t.Run("non-k3s roles produce nil (no exec)", func(t *testing.T) {
+		for _, role := range []Role{RoleDatastore, RoleLB} {
+			if args := rmStaleServingCertsArgs(role); args != nil {
+				t.Errorf("role %v must produce no argv (skip the exec), got %v", role, args)
+			}
+		}
+	})
+}
