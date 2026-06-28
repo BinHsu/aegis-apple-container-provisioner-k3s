@@ -189,6 +189,14 @@ func validateEtcdMemberCount(n int) error {
 	return nil
 }
 
+// etcdClusterToken is etcd's --initial-cluster-token for one cluster's quorum: <cluster>-etcd. It
+// isolates this cluster's members from any other etcd quorum on the same network. The SINGLE source
+// of truth so the create recipe (buildEtcdRunArgs) and the -restore recipe (buildEtcdRestoreArgs)
+// agree: a snapshot restore that used a different token would form an unrelated cluster.
+func etcdClusterToken(clusterName string) string {
+	return clusterName + "-etcd"
+}
+
 // etcdNodeName is the bare name of etcd member i (1-based): <cluster>-etcd-<i>. Cluster-scoped
 // (like every other node: <cluster>-server-N, <cluster>-agent-N) so two HA clusters sharing one
 // DNS domain never collide on the same etcd FQDN. It is both the etcd member name (--name after
@@ -230,6 +238,12 @@ func etcdMembers(clusterName string, count int, memBytes int64) []NodeConfig {
 // reach each other by name (ADR-0003). The member name matches each member's etcd --name. Peer URLs
 // are https:// (v0.5.0): the managed quorum now runs over mutual TLS (etcd_tls.go), and the member
 // server cert's FQDN SAN keeps verification valid across the IP shift.
+//
+// clusterName IS cluster-scoped: the two real callers pass cfg.Name (Create) and state.ClusterName
+// (-restore). unparam resolves it against the apple package's only concrete cluster-name literals —
+// the "aegis" test fixtures — and mistakes that for a constant param, hence the suppression.
+//
+//nolint:unparam // see the note above: clusterName is genuinely parametrized (cfg.Name / state.ClusterName).
 func etcdInitialCluster(clusterName, domain string, count int) string {
 	parts := make([]string, count)
 	for i := range parts {
@@ -313,7 +327,7 @@ func buildEtcdRunArgs(cfg ClusterConfig, node NodeConfig, dnsDomain, initialClus
 		"--advertise-client-urls", "https://"+net.JoinHostPort(fqdn, strconv.Itoa(etcdClientPort)),
 		"--initial-cluster", initialCluster,
 		"--initial-cluster-state", "new",
-		"--initial-cluster-token", cfg.Name+"-etcd", // isolates this cluster's quorum from any other on the network
+		"--initial-cluster-token", etcdClusterToken(cfg.Name), // isolates this cluster's quorum from any other on the network
 	)
 
 	// Mutual-TLS flags for the peer and client ports (v0.5.0). Kept in a helper so this recipe stays

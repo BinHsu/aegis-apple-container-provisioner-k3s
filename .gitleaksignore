@@ -1,0 +1,4 @@
+# False positive: gitleaks generic-api-key matches the etcdctl `--key` FLAG name next to a path
+# constant (etcdTLSMount = "/etc/etcd/tls") in a unit test. No secret — it asserts a CLI arg vector.
+# The line also carries an inline //gitleaks:allow (which covers the squash-merged commit on main).
+b027db8db03c34a8a5e72b8bb443433ecb294144:provider/apple/v060_test.go:generic-api-key:99

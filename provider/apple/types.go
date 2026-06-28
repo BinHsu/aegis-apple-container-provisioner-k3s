@@ -149,11 +149,24 @@ type ClusterConfig struct {
 }
 
 // NodeInfo is a launched node's discovered state.
+//
+// The launch-spec fields (Memory, NanoCPUs, Labels, ExtraArgs) are recorded so a v0.6.0
+// day-2 operation that RECREATES a node (a rolling -upgrade/-rollback, or -rotate-token,
+// which stop+rm the container and relaunch it on the SAME named volume) can reproduce the
+// node's original sizing and k3s flags instead of silently resetting them to defaults.
+// They are populated for k3s nodes by launchNode and for etcd members by provisionEtcdCluster;
+// pre-v0.6.0 states omit them and unmarshal to the zero value (recreate then falls back to the
+// container runtime's own defaults — flagged, not silently "correct"). All omitempty so an
+// older reader and a node carrying none of them produce byte-identical JSON.
 type NodeInfo struct {
-	ID   string       `json:"id"`   // container name (FQDN when dns-domain is set)
-	Name string       `json:"name"` // bare node name; used for volume naming in Destroy
-	Role Role         `json:"role"`
-	IPs  []netip.Addr `json:"ips"`
+	ID        string       `json:"id"`   // container name (FQDN when dns-domain is set)
+	Name      string       `json:"name"` // bare node name; used for volume naming in Destroy
+	Role      Role         `json:"role"`
+	IPs       []netip.Addr `json:"ips"`
+	Memory    int64        `json:"memory,omitempty"`    // bytes; recorded so a recreate keeps the node's size
+	NanoCPUs  int64        `json:"nanoCpus,omitempty"`  // nano-CPUs; ditto
+	Labels    []string     `json:"labels,omitempty"`    // k3s --node-label list, reapplied on recreate
+	ExtraArgs []string     `json:"extraArgs,omitempty"` // verbatim k3s passthrough args, reapplied on recreate
 }
 
 // ClusterState is what Create persists to <statedir>/<name>/state.json and Destroy
@@ -174,7 +187,18 @@ type ClusterState struct {
 	// DatastoreEndpoint is the external --datastore-endpoint the cluster runs on, recorded
 	// for visibility and so HA context survives in state.json. Empty for single-server
 	// sqlite clusters; pre-v0.2.0 states omit the field and unmarshal to "".
-	DatastoreEndpoint string     `json:"datastoreEndpoint,omitempty"`
-	ServerURL         string     `json:"serverURL"` // https://<server-fqdn>:6443 (FQDN or IP)
-	Nodes             []NodeInfo `json:"nodes"`
+	DatastoreEndpoint string `json:"datastoreEndpoint,omitempty"`
+	// DatastoreImage is the managed etcd member image the cluster was created with (the raw
+	// ClusterConfig.DatastoreImage, possibly "" for the pinned default). Recorded in v0.6.0 so a
+	// day-2 op that recreates the etcd members (-restore) or restarts them (-rotate-certs) relaunches
+	// them on the SAME image instead of the default. Empty for a bring-your-own datastore (no managed
+	// etcd) and for pre-v0.6.0 states.
+	DatastoreImage string `json:"datastoreImage,omitempty"`
+	// PreviousImage is the k3s image the cluster ran BEFORE the most recent -upgrade, pinned so
+	// -rollback can return to it (v0.6.0). Empty until the first upgrade. -rollback swaps Image and
+	// PreviousImage so a rollback is itself reversible (re-running -rollback re-applies the image
+	// that was just rolled away from). Pre-v0.6.0 states omit it and unmarshal to "".
+	PreviousImage string     `json:"previousImage,omitempty"`
+	ServerURL     string     `json:"serverURL"` // https://<server-fqdn>:6443 (FQDN or IP)
+	Nodes         []NodeInfo `json:"nodes"`
 }

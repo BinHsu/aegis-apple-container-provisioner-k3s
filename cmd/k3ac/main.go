@@ -78,6 +78,9 @@ func run() error {
 	flag.Var(&manifests, "manifest", "host-side manifest file auto-deployed via the bootstrap server (repeatable)")
 	flag.Var(&envVars, "env", "environment variable KEY=VALUE injected into every k3s node (repeatable)")
 
+	// v0.6.0 day-2 operation flags, registered in a helper so run() stays within the funlen budget.
+	d2 := registerDay2Flags()
+
 	flag.Parse()
 
 	// Apply config-file values for any flag the user did NOT set explicitly (extracted to
@@ -138,6 +141,19 @@ func run() error {
 
 		fmt.Printf("started cluster %q\n", *startName)
 
+		return nil
+	}
+
+	// v0.6.0 day-2 operations take precedence over create (like -start/-stop above). The dispatcher
+	// runs at most one and reports whether it handled the invocation, so a day-2 flag never falls
+	// through to the create path. Extracted to keep run() within the funlen budget.
+	if handled, err := dispatchDay2(ctx, prov, day2Inputs{
+		stateDir: *stateDir, image: *k3sImage, forceB: *d2.force,
+		snapshot: *d2.snapshot, restore: *d2.restore, snapshotFile: *d2.snapshotFile,
+		upgrade: *d2.upgrade, rollback: *d2.rollback, rotateCerts: *d2.rotateCerts, rotateToken: *d2.rotateToken,
+	}); err != nil {
+		return err
+	} else if handled {
 		return nil
 	}
 
@@ -246,6 +262,125 @@ func runDestroy(ctx context.Context, prov clusterDestroyer, stateDir, clusterNam
 	fmt.Printf("destroyed cluster %q\n", clusterName)
 
 	return nil
+}
+
+// day2FlagRefs bundles the pointers the v0.6.0 day-2 flags register into. Registered in
+// registerDay2Flags (called from run before flag.Parse) so the ~9 flag declarations live outside
+// run()'s body and run stays within the funlen budget — the same extraction reasoning as flagRefs.
+type day2FlagRefs struct {
+	snapshot, restore, snapshotFile             *string
+	upgrade, rollback, rotateCerts, rotateToken *string
+	force                                       *bool
+}
+
+// registerDay2Flags declares the v0.6.0 day-2 operation flags and returns pointers to them. The
+// destructive verbs (everything except -snapshot) refuse to run without -force: a bare invocation
+// prints exactly what it WOULD do and exits non-zero.
+func registerDay2Flags() day2FlagRefs {
+	return day2FlagRefs{
+		snapshot:     flag.String("snapshot", "", "save an etcd snapshot of the named cluster's managed datastore to a host path (safe, read-only)"),
+		restore:      flag.String("restore", "", "restore the named cluster's managed datastore from -snapshot-file (DESTRUCTIVE, needs -force)"),
+		snapshotFile: flag.String("snapshot-file", "", "snapshot file path for -restore"),
+		upgrade:      flag.String("upgrade", "", "roll the named cluster's k3s nodes onto -image, one at a time (DESTRUCTIVE, needs -force)"),
+		rollback:     flag.String("rollback", "", "roll the named cluster back to the image pinned at the last -upgrade (DESTRUCTIVE, needs -force)"),
+		rotateCerts:  flag.String("rotate-certs", "", "regenerate + redeliver the named cluster's etcd TLS and rotate each server's certs (DESTRUCTIVE, needs -force)"),
+		rotateToken:  flag.String("rotate-token", "", "generate a new K3S_TOKEN and re-register the named cluster's servers + agents (DESTRUCTIVE, needs -force)"),
+		force:        flag.Bool("force", false, "confirm a DESTRUCTIVE day-2 operation (-restore/-upgrade/-rollback/-rotate-certs/-rotate-token)"),
+	}
+}
+
+// day2Ops is the v0.6.0 day-2 capability set the dispatcher needs from the provisioner. The concrete
+// *provisioner is unexported, so it is passed through this interface (same pattern as k3sCreator /
+// clusterDestroyer). The destructive verbs take a force bool — the provider prints the plan and
+// refuses without it.
+type day2Ops interface {
+	Snapshot(ctx context.Context, stateDir, clusterName string, logw io.Writer) (string, error)
+	Restore(ctx context.Context, stateDir, clusterName, snapshotPath string, force bool, logw io.Writer) error
+	Upgrade(ctx context.Context, stateDir, clusterName, newImage string, force bool, logw io.Writer) (apple.ClusterState, error)
+	Rollback(ctx context.Context, stateDir, clusterName string, force bool, logw io.Writer) (apple.ClusterState, error)
+	RotateCerts(ctx context.Context, stateDir, clusterName string, force bool, logw io.Writer) error
+	RotateToken(ctx context.Context, stateDir, clusterName string, force bool, logw io.Writer) (apple.ClusterState, error)
+}
+
+// day2Inputs groups the resolved day-2 flags so dispatchDay2 takes one parameter (the same
+// readability reasoning as clusterConfigInputs / nodeSpec). Each cluster-name field is non-empty only
+// when its flag was set; the dispatcher runs the first one that is. snapshotFile feeds -restore and
+// image feeds -upgrade; forceB confirms the destructive verbs.
+type day2Inputs struct {
+	stateDir, image                             string
+	snapshot, restore, snapshotFile             string
+	upgrade, rollback, rotateCerts, rotateToken string
+	forceB                                      bool
+}
+
+// dispatchDay2 runs at most one v0.6.0 day-2 operation and reports whether it handled the invocation.
+// It returns (false, nil) when no day-2 flag was set, so run() falls through to create. Mutually
+// exclusive by construction: the first non-empty flag wins and returns, so a single invocation does
+// exactly one thing (mirrors the -stop-before-start precedence in run()).
+func dispatchDay2(ctx context.Context, ops day2Ops, in day2Inputs) (bool, error) {
+	switch {
+	case in.snapshot != "":
+		path, err := ops.Snapshot(ctx, in.stateDir, in.snapshot, log.Writer())
+		if err != nil {
+			return true, fmt.Errorf("snapshotting cluster %q: %w", in.snapshot, err)
+		}
+
+		fmt.Printf("etcd snapshot saved to %s\n", path)
+
+		return true, nil
+	case in.restore != "":
+		if err := ops.Restore(ctx, in.stateDir, in.restore, in.snapshotFile, in.forceB, log.Writer()); err != nil {
+			return true, fmt.Errorf("restoring cluster %q: %w", in.restore, err)
+		}
+
+		fmt.Printf("restored cluster %q from %s\n", in.restore, in.snapshotFile)
+
+		return true, nil
+	case in.upgrade != "":
+		return dispatchRolling(ctx, ops.Upgrade, in.stateDir, in.upgrade, in.image, in.forceB, "upgraded")
+	case in.rollback != "":
+		state, err := ops.Rollback(ctx, in.stateDir, in.rollback, in.forceB, log.Writer())
+		if err != nil {
+			return true, fmt.Errorf("rolling back cluster %q: %w", in.rollback, err)
+		}
+
+		fmt.Printf("rolled back cluster %q to %s\n", in.rollback, state.Image)
+
+		return true, nil
+	case in.rotateCerts != "":
+		if err := ops.RotateCerts(ctx, in.stateDir, in.rotateCerts, in.forceB, log.Writer()); err != nil {
+			return true, fmt.Errorf("rotating certs for cluster %q: %w", in.rotateCerts, err)
+		}
+
+		fmt.Printf("rotated certs for cluster %q\n", in.rotateCerts)
+
+		return true, nil
+	case in.rotateToken != "":
+		if _, err := ops.RotateToken(ctx, in.stateDir, in.rotateToken, in.forceB, log.Writer()); err != nil {
+			return true, fmt.Errorf("rotating token for cluster %q: %w", in.rotateToken, err)
+		}
+
+		fmt.Printf("rotated K3S_TOKEN for cluster %q\n", in.rotateToken)
+
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// dispatchRolling runs an -upgrade-shaped op (target image + force) and reports the resulting image.
+// Shared so -upgrade keeps the same shape as the other verbs without duplicating the error/report.
+func dispatchRolling(ctx context.Context, op func(context.Context, string, string, string, bool, io.Writer) (apple.ClusterState, error),
+	stateDir, clusterName, image string, force bool, verb string,
+) (bool, error) {
+	state, err := op(ctx, stateDir, clusterName, image, force, log.Writer())
+	if err != nil {
+		return true, fmt.Errorf("%s cluster %q: %w", verb, clusterName, err)
+	}
+
+	fmt.Printf("%s cluster %q to %s\n", verb, clusterName, state.Image)
+
+	return true, nil
 }
 
 // k3sCreator is the create capability runCreate needs from the provisioner. The concrete type
