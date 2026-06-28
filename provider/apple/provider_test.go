@@ -5,6 +5,7 @@ package apple
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -202,61 +203,344 @@ func TestBuildRunArgs_SingleServerNoDatastoreFlag(t *testing.T) {
 	}
 }
 
-// TestBuildDatastoreRunArgs locks the managed Postgres datastore recipe (Phase B / G9):
-// correct image, POSTGRES_* env, the PGDATA subdir guard (ext4 named volume ships a
-// lost+found), the data named volume, the cluster labels (so the destroy sweep reclaims it),
-// the FQDN --name — and crucially NONE of the k3s recipe (no --cap-add ALL, no tmpfs, no k3s
-// subcommand; the image is the final arg).
-func TestBuildDatastoreRunArgs(t *testing.T) {
+// TestValidateEtcdMemberCount is the BVA (CLAUDE.md k) on the etcd quorum invariant — the pure
+// odd-and-≥3 boundary. Members below 3 cannot tolerate a single loss; even counts gain no fault
+// tolerance and risk a split vote. Boundaries: 1=reject, 2=reject, 3=accept, 4=reject, 5=accept
+// (plus 0 below 3 and 6 even, for completeness around B=3).
+func TestValidateEtcdMemberCount(t *testing.T) {
+	tests := []struct {
+		n       int
+		wantErr bool
+	}{
+		{0, true},  // below minimum
+		{1, true},  // B-2: below minimum (and odd, but < 3)
+		{2, true},  // B-1: even and below minimum
+		{3, false}, // B: smallest valid quorum
+		{4, true},  // B+1: even
+		{5, false}, // next valid odd
+		{6, true},  // even
+	}
+
+	for _, tt := range tests {
+		err := validateEtcdMemberCount(tt.n)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("validateEtcdMemberCount(%d): wantErr=%v, got err=%v", tt.n, tt.wantErr, err)
+		}
+	}
+}
+
+// TestEtcdInitialClusterAndEndpoint locks the two FQDN string constructions for N members — the
+// single source of truth shared by buildEtcdRunArgs (--initial-cluster) and the k3s servers
+// (--datastore-endpoint). BVA on member count: B=3 (the default/minimum) and B+2=5.
+func TestEtcdInitialClusterAndEndpoint(t *testing.T) {
+	// 3 members: each member-name keyed to its FQDN peer URL, comma-joined, in order.
+	wantInitial3 := "aegis-etcd-1=http://aegis-etcd-1.aegis:2380," +
+		"aegis-etcd-2=http://aegis-etcd-2.aegis:2380," +
+		"aegis-etcd-3=http://aegis-etcd-3.aegis:2380"
+	if got := etcdInitialCluster("aegis", "aegis", 3); got != wantInitial3 {
+		t.Errorf("etcdInitialCluster(3):\n got %q\nwant %q", got, wantInitial3)
+	}
+
+	wantEndpoint3 := "http://aegis-etcd-1.aegis:2379," +
+		"http://aegis-etcd-2.aegis:2379," +
+		"http://aegis-etcd-3.aegis:2379"
+	if got := etcdDatastoreEndpoint("aegis", "aegis", 3); got != wantEndpoint3 {
+		t.Errorf("etcdDatastoreEndpoint(3):\n got %q\nwant %q", got, wantEndpoint3)
+	}
+
+	// 5 members: exactly five comma-separated client URLs (one per member).
+	if got := strings.Count(etcdDatastoreEndpoint("aegis", "aegis", 5), "http://"); got != 5 {
+		t.Errorf("etcdDatastoreEndpoint(5): got %d client URLs, want 5", got)
+	}
+
+	if got := strings.Count(etcdInitialCluster("aegis", "aegis", 5), "=http://"); got != 5 {
+		t.Errorf("etcdInitialCluster(5): got %d member entries, want 5", got)
+	}
+}
+
+// TestEtcdHelpers locks the etcd member naming + per-member volume derivation, the single source
+// of truth shared by buildEtcdRunArgs (create) and destroyRecordedNodes (teardown).
+func TestEtcdHelpers(t *testing.T) {
+	if got := etcdNodeName("aegis", 2); got != "aegis-etcd-2" {
+		t.Errorf("etcdNodeName: got %q, want aegis-etcd-2", got)
+	}
+
+	// Per-member volume — keyed on the member name so each of the N members gets its own.
+	if got := etcdVolumeName("aegis-etcd-2"); got != "aegis-etcd-2-data" {
+		t.Errorf("etcdVolumeName: got %q, want aegis-etcd-2-data", got)
+	}
+
+	members := etcdMembers("aegis", 3)
+	if len(members) != 3 {
+		t.Fatalf("etcdMembers(3): got %d members, want 3", len(members))
+	}
+
+	for i, m := range members {
+		if m.Role != RoleDatastore {
+			t.Errorf("member %d: role %v, want RoleDatastore", i, m.Role)
+		}
+
+		if want := fmt.Sprintf("aegis-etcd-%d", i+1); m.Name != want {
+			t.Errorf("member %d: name %q, want %q", i, m.Name, want)
+		}
+	}
+}
+
+// TestBuildEtcdRunArgs locks the etcd member recipe (ADR-0003): the CONTAINER --name is the FQDN
+// (so container DNS registers the peer — MANDATORY, a bare name leaves peers at NXDOMAIN and
+// quorum never forms), the etcd MEMBER --name is the bare name keyed in --initial-cluster, the
+// data dir is a SUBDIR of the mounted volume (lost+found guard), all peer/client URLs are FQDNs,
+// the cluster labels are present (destroy sweep), and crucially NONE of the k3s recipe (no
+// --cap-add ALL, no tmpfs, no k3s subcommand; the image precedes the etcd flags).
+func TestBuildEtcdRunArgs(t *testing.T) {
 	cfg := recipeCfg()
-	args := buildDatastoreRunArgs(cfg, "s3cr3t", "aegis")
+	member := NodeConfig{Name: "aegis-etcd-1", Role: RoleDatastore, Memory: defaultEtcdMemoryBytes}
+	initial := etcdInitialCluster("aegis", "aegis", 3)
+
+	args := buildEtcdRunArgs(cfg, member, "aegis", initial)
 	joined := strings.Join(args, " ")
 
 	checks := []struct {
 		ok   bool
 		desc string
 	}{
-		{hasPair(args, "--name", "aegis-db.aegis"), "--name is the datastore FQDN"},
-		{hasPair(args, "--env", "POSTGRES_USER=kine"), "POSTGRES_USER=kine"},
-		{hasPair(args, "--env", "POSTGRES_PASSWORD=s3cr3t"), "POSTGRES_PASSWORD set from the generated password"},
-		{hasPair(args, "--env", "POSTGRES_DB=kine"), "POSTGRES_DB=kine"},
-		{hasPair(args, "--env", "PGDATA="+datastorePGDataDir), "PGDATA points at a subdir (lost+found guard, G9)"},
-		{hasPair(args, "--volume", datastoreVolumeName("aegis")+":"+datastoreDataMount), "Postgres data on the named volume"},
+		{hasPair(args, "--name", "aegis-etcd-1.aegis"), "CONTAINER --name is the member FQDN (container DNS registers it — MANDATORY)"},
+		{hasPair(args, "--name", "aegis-etcd-1"), "etcd MEMBER --name is the bare name (keyed in --initial-cluster)"},
+		{hasPair(args, "--volume", etcdVolumeName("aegis-etcd-1")+":"+etcdDataMount), "data on the per-member named volume at the mount root"},
+		{hasPair(args, "--data-dir", etcdDataDir), "--data-dir is a SUBDIR of the mount (ext4 lost+found guard)"},
+		{strings.HasPrefix(etcdDataDir, etcdDataMount+"/"), "data dir is strictly under the mount"},
+		{hasPair(args, "--initial-advertise-peer-urls", "http://aegis-etcd-1.aegis:2380"), "advertise peer URL is the FQDN (name-bound membership)"},
+		{hasPair(args, "--advertise-client-urls", "http://aegis-etcd-1.aegis:2379"), "advertise client URL is the FQDN"},
+		{hasPair(args, "--listen-peer-urls", "http://0.0.0.0:2380"), "listen peer URL binds all interfaces"},
+		{hasPair(args, "--listen-client-urls", "http://0.0.0.0:2379"), "listen client URL binds all interfaces"},
+		{hasPair(args, "--initial-cluster", initial), "--initial-cluster carries the full FQDN member list"},
+		{hasPair(args, "--initial-cluster-state", "new"), "--initial-cluster-state new"},
+		{hasPair(args, "--initial-cluster-token", "aegis-etcd"), "--initial-cluster-token isolates this cluster's quorum"},
 		{hasPair(args, "--label", "k3s.cluster.name=aegis"), "cluster label (destroy sweep reclaims it)"},
 		{hasPair(args, "--label", "k3s.role=datastore"), "role=datastore label"},
 		{hasPair(args, "--label", "k3s.owned=true"), "owned label"},
-		{!strings.Contains(joined, "--cap-add"), "NO --cap-add (postgres is not k3s)"},
+		{memoryUsesMB(args), "--memory uses the MB suffix (bare M rejected)"},
+		{!strings.Contains(joined, "--cap-add"), "NO --cap-add (etcd is not k3s)"},
 		{!tmpfsContains(args, "/run") && !tmpfsContains(args, "/tmp"), "NO tmpfs (not a k3s node)"},
-		{!strings.Contains(joined, "server") && !strings.Contains(joined, "agent"), "NO k3s subcommand"},
-		{args[len(args)-1] == defaultDatastoreImage, "image is the final arg (no trailing subcommand)"},
+		{!hasNamedDatastoreVolume(args), "NO k3s /var/lib/rancher/k3s datastore volume"},
+		{!strings.Contains(joined, "--cluster-init"), "NO --cluster-init (this is EXTERNAL etcd, not embedded)"},
+		{etcdImageIndex(args) >= 0, "etcd image present"},
+		{etcdImageIndex(args) < len(args)-1, "etcd flags follow the image (image is NOT the final arg)"},
+		// REGRESSION (v0.3.0 hardware bring-up): the token IMMEDIATELY after the image must be the
+		// etcd binary. The image has no ENTRYPOINT, so Apple `container` execs the first post-image
+		// arg; if that is a flag (e.g. --name) the member dies "failed to find target executable".
+		{etcdImageIndex(args) >= 0 && args[etcdImageIndex(args)+1] == etcdBinary, "etcd binary is the first arg after the image (not a flag)"},
 	}
 
 	for _, c := range checks {
 		if !c.ok {
-			t.Errorf("datastore recipe check failed: %s\nargs: %s", c.desc, joined)
+			t.Errorf("etcd recipe check failed: %s\nargs: %s", c.desc, joined)
 		}
 	}
 }
 
-// TestDatastoreHelpers locks the datastore naming + endpoint derivation, the single source of
-// truth shared by buildDatastoreRunArgs (create) and destroyRecordedNodes (teardown).
-func TestDatastoreHelpers(t *testing.T) {
-	if got := datastoreNodeName("aegis"); got != "aegis-db" {
-		t.Errorf("datastoreNodeName: got %q, want aegis-db", got)
+// TestBuildEtcdRunArgs_Network verifies the optional --network flag is threaded through when set
+// (mirrors the k3s/LB recipes) and omitted when left empty (the built-in default).
+func TestBuildEtcdRunArgs_Network(t *testing.T) {
+	cfg := recipeCfg()
+	cfg.Network = "k3snet"
+	member := NodeConfig{Name: "aegis-etcd-1", Role: RoleDatastore, Memory: defaultEtcdMemoryBytes}
+
+	if !hasPair(buildEtcdRunArgs(cfg, member, "aegis", "x=y"), "--network", "k3snet") {
+		t.Error("custom network must be passed to the etcd container")
 	}
 
-	if got := datastoreVolumeName("aegis"); got != "aegis-db-pg" {
-		t.Errorf("datastoreVolumeName: got %q, want aegis-db-pg", got)
-	}
-
-	want := "postgres://kine:pw123@aegis-db.aegis:5432/kine?sslmode=disable"
-	if got := datastoreEndpointURL("aegis", "aegis", "pw123"); got != want {
-		t.Errorf("datastoreEndpointURL:\n got %q\nwant %q", got, want)
+	cfg.Network = ""
+	if slices.Contains(buildEtcdRunArgs(cfg, member, "aegis", "x=y"), "--network") {
+		t.Error("empty network must NOT emit --network")
 	}
 }
 
-// TestEnsureRemovable guards that -remove-node refuses both a server and the managed datastore
-// (cluster-destroying acts) and permits an agent.
+// TestDestroyEtcdVolumeEnumeration proves the teardown derives the SAME per-member volume name
+// that create provisioned, for every etcd member — the create/destroy symmetry that guarantees a
+// destroy reclaims exactly the volumes create made (no orphans, no wrong target). It mirrors the
+// role-keyed branch in destroyRecordedNodes: RoleDatastore -> etcdVolumeName(node.Name).
+func TestDestroyEtcdVolumeEnumeration(t *testing.T) {
+	// A 3-member etcd cluster as Create would record it (RoleDatastore, member names).
+	members := etcdMembers("aegis", 3)
+
+	for _, m := range members {
+		node := NodeInfo{Name: m.Name, Role: RoleDatastore}
+
+		// Re-derive the volume the way destroyRecordedNodes does for a RoleDatastore node.
+		var vol string
+		if node.Role == RoleDatastore {
+			vol = etcdVolumeName(node.Name)
+		} else {
+			vol = nodeVolumeName("aegis", node.Name)
+		}
+
+		if want := m.Name + "-data"; vol != want {
+			t.Errorf("destroy would target %q for member %q, want %q (create/destroy symmetry)", vol, m.Name, want)
+		}
+	}
+}
+
+// TestAPILBHelpers locks the LB node naming, the single source of truth shared by
+// buildAPILBRunArgs (create) and the kubeconfig endpoint. The LB's FQDN MUST equal
+// clusterAPIFQDN (the name baked into every server's --tls-san) or the LB's serving cert would
+// fail client verification.
+func TestAPILBHelpers(t *testing.T) {
+	if got := apiLBNodeName("aegis"); got != "aegis-api" {
+		t.Errorf("apiLBNodeName: got %q, want aegis-api", got)
+	}
+
+	// The LB container --name (nodeFQDN of the bare name) must be identical to the --tls-san name.
+	if got, want := nodeFQDN(apiLBNodeName("aegis"), "aegis"), clusterAPIFQDN("aegis", "aegis"); got != want {
+		t.Errorf("LB FQDN %q must equal the cert SAN %q (else TLS verification fails)", got, want)
+	}
+}
+
+// TestClusterAPIEndpoint is the BVA (CLAUDE.md k) on the LB on/off boundary — the pure logic that
+// decides what the kubeconfig + agents target. The behavioral boundary is "is an API LB in front":
+//   - LB off, FQDN mode (single-server, B=1 in cmd): the bootstrap SERVER's own FQDN endpoint.
+//   - LB on, FQDN mode (multi-server, B+1 in cmd): the shared <cluster>-api.<domain> LB endpoint.
+//   - LB on, IP-only (no DNS domain): falls back to the bootstrap server IP — the same gate
+//     setupAPILB uses, so the endpoint can never name an LB that was not provisioned.
+//   - LB off, IP-only: the bootstrap server IP (v0.1.x).
+//
+// The serverCount > 1 -> ProvisionAPILB mapping itself is an inline inference in cmd/k3ac/main.go
+// (mirroring ManageDatastore); it is exercised here behaviorally via the ProvisionAPILB flag.
+func TestClusterAPIEndpoint(t *testing.T) {
+	ip := netip.MustParseAddr("192.168.64.7")
+
+	tests := []struct {
+		name      string
+		lb        bool
+		dnsDomain string
+		want      string
+	}{
+		{"LB off, FQDN: bootstrap server FQDN", false, "aegis", "https://aegis-server-1.aegis:6443"},
+		{"LB on, FQDN: shared LB FQDN", true, "aegis", "https://aegis-api.aegis:6443"},
+		{"LB on, IP-only: server IP (LB skipped, no FQDN)", true, "", "https://192.168.64.7:6443"},
+		{"LB off, IP-only: server IP", false, "", "https://192.168.64.7:6443"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := ClusterConfig{Name: "aegis", ProvisionAPILB: tt.lb}
+			if got := clusterAPIEndpoint(cfg, "aegis-server-1", ip, tt.dnsDomain); got != tt.want {
+				t.Errorf("clusterAPIEndpoint = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildAPILBConfig locks the haproxy.cfg recipe — the load-bearing requirement that the LB is
+// an L4/TCP PASSTHROUGH proxy (TLS terminates at the apiserver, not the LB) with FQDN backends
+// that re-resolve at runtime so they survive the vmnet DHCP IP shift.
+func TestBuildAPILBConfig(t *testing.T) {
+	servers := []NodeConfig{
+		{Name: "aegis-server-1", Role: RoleServer},
+		{Name: "aegis-server-2", Role: RoleServer},
+	}
+
+	cfgText := buildAPILBConfig("aegis", servers, "aegis")
+
+	checks := []struct {
+		ok   bool
+		desc string
+	}{
+		{strings.Contains(cfgText, "mode    tcp"), "mode tcp (L4 passthrough; TLS NOT terminated at the LB)"},
+		{!strings.Contains(cfgText, "mode http") && !strings.Contains(cfgText, "ssl crt"), "no L7/HTTP mode and no TLS termination (`ssl crt`)"},
+		{strings.Contains(cfgText, "bind *:6443"), "frontend binds the apiserver port 6443"},
+		{strings.Contains(cfgText, "server srv1 aegis-server-1.aegis:6443"), "backend 1 addressed by server FQDN (not IP)"},
+		{strings.Contains(cfgText, "server srv2 aegis-server-2.aegis:6443"), "backend 2 addressed by server FQDN (not IP)"},
+		{strings.Contains(cfgText, "resolvers containerdns"), "a resolvers section drives runtime backend re-resolution"},
+		{strings.Contains(cfgText, "parse-resolv-conf"), "parse-resolv-conf reuses the container DNS that re-registers <node>.<domain>"},
+		{strings.Contains(cfgText, "resolve-prefer ipv4"), "each server re-resolves its FQDN at runtime (survives the DHCP shift)"},
+		{strings.Contains(cfgText, "init-addr none"), "init-addr none lets haproxy start even if a backend FQDN is not resolvable yet"},
+	}
+
+	for _, c := range checks {
+		if !c.ok {
+			t.Errorf("API LB config check failed: %s\nconfig:\n%s", c.desc, cfgText)
+		}
+	}
+}
+
+// TestBuildAPILBConfig_BackendCount is the BVA (CLAUDE.md k) on the backend-server count: the
+// generated config must emit exactly one `server srvN` line per server. Boundaries B-1=1, B=2,
+// B+1=3 (the LB is only provisioned for >1 server, but the pure renderer must be correct for any
+// count, so all three are exercised).
+func TestBuildAPILBConfig_BackendCount(t *testing.T) {
+	mk := func(n int) []NodeConfig {
+		s := make([]NodeConfig, n)
+		for i := range s {
+			s[i] = NodeConfig{Name: fmt.Sprintf("aegis-server-%d", i+1), Role: RoleServer}
+		}
+
+		return s
+	}
+
+	for _, n := range []int{1, 2, 3} {
+		cfgText := buildAPILBConfig("aegis", mk(n), "aegis")
+		if got := strings.Count(cfgText, "\n    server srv"); got != n {
+			t.Errorf("%d servers: got %d backend lines, want %d\nconfig:\n%s", n, got, n, cfgText)
+		}
+	}
+}
+
+// TestBuildAPILBRunArgs locks the LB `container run` recipe: the FQDN --name (so container DNS
+// registers the cluster API name to the LB), the read-only config bind-mount at the haproxy
+// default dir, the cluster + role labels (so the destroy sweep reclaims it), and crucially NONE
+// of the k3s recipe (no --cap-add, no tmpfs, no named volume, no k3s subcommand; the image is the
+// final arg so the haproxy image's default CMD loads the mounted config).
+func TestBuildAPILBRunArgs(t *testing.T) {
+	cfg := recipeCfg()
+	configDir := "/abs/state/aegis/lb"
+
+	args := buildAPILBRunArgs(cfg, "aegis", configDir)
+	joined := strings.Join(args, " ")
+
+	checks := []struct {
+		ok   bool
+		desc string
+	}{
+		{hasPair(args, "--name", "aegis-api.aegis"), "--name is the cluster API FQDN (container DNS registers it)"},
+		{hasPair(args, "--volume", configDir+":"+apiLBConfigMount+":ro"), "config bind-mounted read-only at the haproxy default dir"},
+		{memoryUsesMB(args), "--memory uses the MB suffix (bare M rejected)"},
+		{hasPair(args, "--label", "k3s.cluster.name=aegis"), "cluster label (destroy sweep reclaims it)"},
+		{hasPair(args, "--label", "k3s.role=lb"), "role=lb label"},
+		{hasPair(args, "--label", "k3s.owned=true"), "owned label"},
+		{slices.Contains(args, "--detach"), "--detach"},
+		{!strings.Contains(joined, "--cap-add"), "NO --cap-add (haproxy is not k3s)"},
+		{!tmpfsContains(args, "/run") && !tmpfsContains(args, "/tmp"), "NO tmpfs (not a k3s node)"},
+		{!hasNamedDatastoreVolume(args), "NO k3s datastore named volume (the LB is stateless)"},
+		{!strings.Contains(joined, " server") && !strings.Contains(joined, " agent"), "NO k3s subcommand"},
+		{args[len(args)-1] == defaultAPILBImage, "image is the final arg (default CMD loads the mounted config)"},
+	}
+
+	for _, c := range checks {
+		if !c.ok {
+			t.Errorf("API LB run-args check failed: %s\nargs: %s", c.desc, joined)
+		}
+	}
+}
+
+// TestBuildAPILBRunArgs_Network verifies the optional --network flag is threaded through when set
+// (mirrors the datastore/k3s recipes) and omitted for the built-in default left empty.
+func TestBuildAPILBRunArgs_Network(t *testing.T) {
+	cfg := recipeCfg()
+	cfg.Network = "k3snet"
+
+	if !hasPair(buildAPILBRunArgs(cfg, "aegis", "/abs/lb"), "--network", "k3snet") {
+		t.Error("custom network must be passed to the LB container")
+	}
+
+	cfg.Network = ""
+	if slices.Contains(buildAPILBRunArgs(cfg, "aegis", "/abs/lb"), "--network") {
+		t.Error("empty network must NOT emit --network")
+	}
+}
+
+// TestEnsureRemovable guards that -remove-node refuses a server, the managed datastore, and the
+// API load balancer (all cluster-destroying acts) and permits an agent.
 func TestEnsureRemovable(t *testing.T) {
 	if err := ensureRemovable(NodeInfo{Name: "s1", Role: RoleServer}); err == nil {
 		t.Error("removing a server must be refused")
@@ -266,14 +550,18 @@ func TestEnsureRemovable(t *testing.T) {
 		t.Error("removing the datastore must be refused")
 	}
 
+	if err := ensureRemovable(NodeInfo{Name: "aegis-api", Role: RoleLB}); err == nil {
+		t.Error("removing the API load balancer must be refused")
+	}
+
 	if err := ensureRemovable(NodeInfo{Name: "a1", Role: RoleAgent}); err != nil {
 		t.Errorf("removing an agent must be allowed, got %v", err)
 	}
 }
 
-// TestRoleString locks the role rendering, including the datastore role used only as a label.
+// TestRoleString locks the role rendering, including the datastore and lb roles used only as labels.
 func TestRoleString(t *testing.T) {
-	for role, want := range map[Role]string{RoleServer: "server", RoleAgent: "agent", RoleDatastore: "datastore"} {
+	for role, want := range map[Role]string{RoleServer: "server", RoleAgent: "agent", RoleDatastore: "datastore", RoleLB: "lb"} {
 		if got := role.String(); got != want {
 			t.Errorf("Role(%d).String(): got %q, want %q", role, got, want)
 		}
@@ -822,4 +1110,11 @@ func subcommandIs(args []string, image, sub string) bool {
 	}
 
 	return false
+}
+
+// etcdImageIndex returns the position of the etcd image positional in args, or -1 if absent.
+// Used to assert the image's placement relative to trailing flags (the binary and etcd flags
+// must follow the image).
+func etcdImageIndex(args []string) int {
+	return slices.Index(args, defaultEtcdImage)
 }

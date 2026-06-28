@@ -27,17 +27,55 @@ const k3sDatastoreMount = "/var/lib/rancher/k3s"
 // k3sAPIPort is the k3s API server / join port.
 const k3sAPIPort = 6443
 
-// Managed datastore (Postgres) recipe constants. The HA spike (VERIFICATION G9, docs/ADR/0002)
-// used exactly these. Image and memory are fixed defaults for now — tuning flags are a
-// deliberate follow-up, not part of this cut.
+// Managed datastore (external etcd cluster) recipe constants. v0.3.0 supersedes ADR-0002's
+// single-Postgres datastore with an auto-provisioned N-node etcd cluster as the default HA
+// datastore (docs/ADR-0003, hardware-verified). Image and memory are fixed defaults for now —
+// tuning flags are a deliberate follow-up, not part of this cut.
 const (
-	defaultDatastoreImage       = "postgres:17-alpine"
-	datastorePort               = 5432
-	datastoreUser               = "kine"
-	datastoreDB                 = "kine"
-	datastoreDataMount          = "/var/lib/postgresql/data"
-	datastorePGDataDir          = "/var/lib/postgresql/data/pgdata" // PGDATA subdir: an ext4 named volume ships a lost+found that blocks initdb at the mount root (G9)
-	defaultDatastoreMemoryBytes = 1024 * 1024 * 1024                // 1 GiB
+	// defaultEtcdImage is the etcd node image. ADR-0003 VERIFIED: quay.io/coreos/etcd:v3.5.16
+	// forms a 3-member FQDN-addressed cluster under Apple container and survives the cold-restart
+	// DHCP IP shift. Use this exact tag.
+	defaultEtcdImage = "quay.io/coreos/etcd:v3.5.16"
+	// etcdBinary is the in-image etcd executable. The image sets Cmd=["/usr/local/bin/etcd"] but
+	// NO ENTRYPOINT, and Apple `container` execs the first post-image arg as the target binary, so
+	// we must name it explicitly — otherwise a bare flag like --name is taken as the executable and
+	// the member dies with `failed to find target executable --name` (caught in v0.3.0 hardware bring-up).
+	etcdBinary     = "/usr/local/bin/etcd"
+	etcdClientPort = 2379 // client/API port; k3s --datastore-endpoint targets this
+	etcdPeerPort   = 2380 // peer port for member-to-member quorum traffic
+	// etcdDataMount is the in-node mount point of the member's named volume. etcdDataDir is a
+	// SUBDIR of it: an ext4 named volume ships a lost+found at the mount root, which etcd refuses
+	// as a data dir (ADR-0003 gotcha, mirrors the Postgres PGDATA-subdir guard in ADR-0002).
+	etcdDataMount = "/data"
+	etcdDataDir   = "/data/etcd"
+	// defaultEtcdMembers is the default etcd cluster size. MUST be odd for quorum (3 or 5);
+	// validateEtcdMemberCount enforces that. 3 tolerates losing 1 member.
+	defaultEtcdMembers     = 3
+	minEtcdMembers         = 3
+	defaultEtcdMemoryBytes = 512 * 1024 * 1024 // 512 MiB — etcd is light vs a full Postgres
+)
+
+// API load balancer (RoleLB) recipe constants. The LB is one stateless micro-VM running
+// haproxy in TCP (L4) passthrough mode in front of the HA servers' apiserver port (6443).
+//
+// WHY haproxy mode tcp (not nginx stream, not an L7 proxy): the apiserver speaks mutual TLS
+// and the kubeconfig must verify the apiserver cert END TO END, so the LB must NOT terminate
+// TLS — it forwards raw TCP. Both haproxy `mode tcp` and nginx `stream {}` do L4 passthrough,
+// but this substrate's defining constraint is the vmnet DHCP IP shift on cold restart, so the
+// LB must RE-RESOLVE its backend FQDNs at runtime (not just once at startup). Open-source
+// haproxy has mature runtime DNS re-resolution — a `resolvers` section with `parse-resolv-conf`
+// (reuse the same container DNS that re-registers <node>.<domain> A-records) plus per-server
+// `resolvers`/`resolve-prefer ipv4` — so a backend that moves to a new DHCP IP is picked up
+// within the `hold` TTL. Open-source nginx re-resolves stream upstreams only via the commercial
+// `resolve` parameter (or a single-backend `proxy_pass $var` hack that loses multi-backend
+// balancing), so haproxy is the better fit for surviving the IP shift here.
+const (
+	defaultAPILBImage       = "haproxy:3.0-alpine"     // 3.0 is an LTS; >=2.1 needed for `parse-resolv-conf`
+	apiLBConfigMount        = "/usr/local/etc/haproxy" // haproxy image's default config dir (default CMD reads haproxy.cfg here)
+	apiLBConfigFileName     = "haproxy.cfg"            // the file the default CMD loads
+	apiLBConfigSubdir       = "lb"                     // subdir under the cluster state dir holding the generated haproxy.cfg
+	defaultAPILBMemoryBytes = 256 * 1024 * 1024        // 256 MiB — a TCP passthrough proxy is light
+	apiLBDNSHoldSeconds     = 10                       // backend-FQDN resolution TTL; bounds how fast a shifted DHCP IP is picked up
 )
 
 // kubeconfigMount is the in-node mount point for a HOST bind-mount of the cluster state
@@ -109,55 +147,124 @@ func nodeFQDN(nodeName, domain string) string {
 
 // clusterAPIFQDN returns the shared HA API endpoint name <cluster>-api.<domain>. It is added
 // to every server's --tls-san in HA mode (see buildRunArgs) so a single kubeconfig endpoint
-// and a future API load balancer are cert-valid against any server. It is NOT a container
-// name, so container DNS does not auto-register it — wiring it as the live endpoint is the
-// load-balancer step deferred in docs/ADR/0002.
+// and the API load balancer are cert-valid against any server. As of v0.3.0 it IS a live
+// container name: the RoleLB micro-VM is launched with --name == this FQDN, so container DNS
+// auto-registers it to the LB's IP (and re-registers on the cold-restart shift, like any node).
+// It is identical to nodeFQDN(apiLBNodeName(clusterName), domain) — the single source of truth
+// is kept here because the --tls-san wiring predates the LB node.
 func clusterAPIFQDN(clusterName, domain string) string {
 	return clusterName + "-api." + domain
 }
 
-// datastoreNodeName is the bare name of the managed datastore node: <cluster>-db. The FQDN
-// (datastoreNodeName + "." + domain) is both the container --name and the host that the
-// servers' --datastore-endpoint points at, so container DNS re-registers it to the new IP on
-// a cold restart (the property that makes external-datastore HA survive the DHCP shift, G9).
-func datastoreNodeName(clusterName string) string {
-	return clusterName + "-db"
+// apiLBNodeName is the bare name of the API load-balancer node: <cluster>-api. Its FQDN
+// (apiLBNodeName + "." + domain) equals clusterAPIFQDN and is both the container --name and the
+// host that the kubeconfig + agents target, so container DNS re-registers it to the new IP on a
+// cold restart — the same FQDN mechanism that stabilizes every other endpoint (ADR-0001).
+func apiLBNodeName(clusterName string) string {
+	return clusterName + "-api"
 }
 
-// datastoreVolumeName is the named volume backing the managed Postgres data dir. It does NOT
-// follow the k3s nodeVolumeName scheme (that is <cluster>-<node>-k3s for /var/lib/rancher/k3s);
-// destroyRecordedNodes special-cases RoleDatastore to delete this name.
-func datastoreVolumeName(clusterName string) string {
-	return sanitizeVolumeName(clusterName + "-db-pg")
+// validateEtcdMemberCount enforces the etcd quorum invariant: an odd member count of at least
+// minEtcdMembers (3). Even counts gain no fault tolerance over the next-lower odd count and risk
+// a split vote; fewer than 3 cannot tolerate a single loss (the whole point of HA). Pure so the
+// boundary is unit-testable (BVA, CLAUDE.md k): 1=reject, 2=reject, 3=accept, 4=reject, 5=accept.
+func validateEtcdMemberCount(n int) error {
+	if n < minEtcdMembers {
+		return fmt.Errorf("etcd cluster needs at least %d members for quorum, got %d", minEtcdMembers, n)
+	}
+
+	if n%2 == 0 {
+		return fmt.Errorf("etcd member count must be odd (3 or 5) for a stable quorum, got %d", n)
+	}
+
+	return nil
 }
 
-// datastoreEndpointURL builds the k3s --datastore-endpoint for the managed Postgres node.
-// sslmode=disable: the datastore is on the private vmnet and v0.2.0 does not provision TLS for
-// it (a documented limit in docs/ADR/0002; k3s supports --datastore-cafile/certfile/keyfile for
-// hardening later). The password is a generated hex string, URL-safe with no escaping needed.
-func datastoreEndpointURL(clusterName, domain, password string) string {
-	host := net.JoinHostPort(nodeFQDN(datastoreNodeName(clusterName), domain), strconv.Itoa(datastorePort))
-
-	return fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", datastoreUser, password, host, datastoreDB)
+// etcdNodeName is the bare name of etcd member i (1-based): <cluster>-etcd-<i>. Cluster-scoped
+// (like every other node: <cluster>-server-N, <cluster>-agent-N) so two HA clusters sharing one
+// DNS domain never collide on the same etcd FQDN. It is both the etcd member name (--name after
+// the image) and the basis of the container --name FQDN (nodeFQDN(etcdNodeName, domain)) that
+// container DNS registers; the two must agree for --initial-cluster to resolve every peer.
+func etcdNodeName(clusterName string, i int) string {
+	return fmt.Sprintf("%s-etcd-%d", clusterName, i)
 }
 
-// buildDatastoreRunArgs assembles the `container run` vector for the managed Postgres datastore
-// micro-VM. Pure function (unit-testable without launching a VM), mirroring buildRunArgs. It is
-// deliberately NOT buildRunArgs: a Postgres node shares none of the k3s recipe (no --cap-add ALL,
-// no tmpfs, no k3s subcommand, a different image, env, data mount, and the PGDATA-subdir guard).
-// It carries the same cluster labels as k3s nodes so the destroy label sweep reclaims it.
-func buildDatastoreRunArgs(cfg ClusterConfig, password, dnsDomain string) []string {
+// etcdVolumeName is the named volume backing one etcd member's data dir. It is keyed on the bare
+// member NAME (not a single shared name like the old Postgres datastore) so each of the N members
+// gets its own volume; destroyRecordedNodes derives the same name per RoleDatastore node. It does
+// NOT follow the k3s nodeVolumeName scheme (<cluster>-<node>-k3s for /var/lib/rancher/k3s).
+func etcdVolumeName(nodeName string) string {
+	return sanitizeVolumeName(nodeName + "-data")
+}
+
+// etcdMembers builds the NodeConfig list for an N-member etcd cluster. Each carries RoleDatastore
+// (a label-only role — etcd members never reach the k3s subcommand path) and the fixed default
+// memory. The members are NOT part of ClusterConfig.Nodes; Create provisions them separately.
+func etcdMembers(clusterName string, count int) []NodeConfig {
+	members := make([]NodeConfig, count)
+	for i := range members {
+		members[i] = NodeConfig{
+			Name:   etcdNodeName(clusterName, i+1),
+			Role:   RoleDatastore,
+			Memory: defaultEtcdMemoryBytes,
+		}
+	}
+
+	return members
+}
+
+// etcdInitialCluster renders etcd's --initial-cluster value: a comma-separated
+// <member-name>=<peer-url> list covering every member, all FQDN-addressed so peer membership is
+// name-bound (not IP-bound) and therefore survives the vmnet DHCP cold-restart shift — the exact
+// failure that ruled out embedded etcd in ADR-0002 but does NOT apply here, because these peers
+// reach each other by name (ADR-0003). The member name matches each member's etcd --name.
+func etcdInitialCluster(clusterName, domain string, count int) string {
+	parts := make([]string, count)
+	for i := range parts {
+		name := etcdNodeName(clusterName, i+1)
+		peer := "http://" + net.JoinHostPort(nodeFQDN(name, domain), strconv.Itoa(etcdPeerPort))
+		parts[i] = name + "=" + peer
+	}
+
+	return strings.Join(parts, ",")
+}
+
+// etcdDatastoreEndpoint builds the k3s --datastore-endpoint for the managed etcd cluster: a
+// comma-separated list of every member's FQDN client URL. k3s tries them in order and fails over,
+// so naming all members (not just one) keeps the control plane reachable when any single member is
+// down. Plain http:// — TLS is deferred (ADR-0003; matches ADR-0002's sslmode=disable precedent on
+// the private vmnet).
+//
+// TODO(v0.3.x): etcd peer/client TLS with FQDN SANs + k3s --datastore-cafile/certfile/keyfile.
+func etcdDatastoreEndpoint(clusterName, domain string, count int) string {
+	parts := make([]string, count)
+	for i := range parts {
+		host := nodeFQDN(etcdNodeName(clusterName, i+1), domain)
+		parts[i] = "http://" + net.JoinHostPort(host, strconv.Itoa(etcdClientPort))
+	}
+
+	return strings.Join(parts, ",")
+}
+
+// buildEtcdRunArgs assembles the `container run` vector for one etcd member micro-VM. Pure
+// (unit-testable without launching a VM), mirroring buildRunArgs and buildAPILBRunArgs.
+// It is deliberately NOT buildRunArgs: an etcd node shares none of the k3s recipe (no --cap-add ALL,
+// no tmpfs, no k3s subcommand, a different image, data mount, and the lost+found-subdir guard). It
+// carries the same cluster labels as k3s nodes so the destroy label sweep reclaims it.
+//
+// Two --name flags appear and that is intentional: the CONTAINER --name (before the image) is the
+// FQDN that container DNS registers (MANDATORY — a bare name leaves every peer at NXDOMAIN and
+// quorum never forms, ADR-0003); the etcd --name (after the image) is the bare member name that
+// --initial-cluster keys on. All peer/client/advertise URLs are FQDNs so membership is name-bound.
+// initialCluster is the shared etcdInitialCluster value (identical for every member).
+func buildEtcdRunArgs(cfg ClusterConfig, node NodeConfig, dnsDomain, initialCluster string) []string {
+	fqdn := nodeFQDN(node.Name, dnsDomain)
+
 	args := []string{
 		"run", "--detach",
-		"--name", nodeFQDN(datastoreNodeName(cfg.Name), dnsDomain),
-		"--memory", fmt.Sprintf("%dMB", defaultDatastoreMemoryBytes/(1024*1024)),
-		"--volume", datastoreVolumeName(cfg.Name) + ":" + datastoreDataMount,
-		"--env", "POSTGRES_USER=" + datastoreUser,
-		"--env", "POSTGRES_PASSWORD=" + password,
-		"--env", "POSTGRES_DB=" + datastoreDB,
-		// PGDATA subdir: the ext4 named volume ships a lost+found, so initdb refuses the mount
-		// root as the data dir (G9). Point it at a subdirectory.
-		"--env", "PGDATA=" + datastorePGDataDir,
+		"--name", fqdn, // CONTAINER name == FQDN so container DNS registers the peer (MANDATORY)
+		"--memory", fmt.Sprintf("%dMB", node.Memory/(1024*1024)),
+		"--volume", etcdVolumeName(node.Name) + ":" + etcdDataMount,
 		"--label", labelOwned + "=true",
 		"--label", labelClusterName + "=" + cfg.Name,
 		"--label", "k3s.role=" + RoleDatastore.String(),
@@ -167,7 +274,138 @@ func buildDatastoreRunArgs(cfg ClusterConfig, password, dnsDomain string) []stri
 		args = append(args, "--network", cfg.Network)
 	}
 
-	args = append(args, defaultDatastoreImage)
+	// Image, the etcd binary, then the etcd flags. Apple `container` execs the first post-image arg
+	// as the target executable; the etcd image sets Cmd=["/usr/local/bin/etcd"] but NO ENTRYPOINT,
+	// so the binary must be named explicitly (a bare --name would otherwise be taken as the
+	// executable). The trailing args are then etcd flags — same shape as a k3s node's
+	// `server`/`agent` subcommand after the image.
+	args = append(args, defaultEtcdImage, etcdBinary,
+		"--name", node.Name, // etcd MEMBER name (bare); must match this member's key in --initial-cluster
+		"--data-dir", etcdDataDir, // subdir of the mount: the ext4 lost+found blocks etcd at the root
+		"--listen-peer-urls", fmt.Sprintf("http://0.0.0.0:%d", etcdPeerPort),
+		"--listen-client-urls", fmt.Sprintf("http://0.0.0.0:%d", etcdClientPort),
+		"--initial-advertise-peer-urls", "http://"+net.JoinHostPort(fqdn, strconv.Itoa(etcdPeerPort)),
+		"--advertise-client-urls", "http://"+net.JoinHostPort(fqdn, strconv.Itoa(etcdClientPort)),
+		"--initial-cluster", initialCluster,
+		"--initial-cluster-state", "new",
+		"--initial-cluster-token", cfg.Name+"-etcd", // isolates this cluster's quorum from any other on the network
+	)
+
+	return args
+}
+
+// clusterAPIEndpoint returns the stable https URL the kubeconfig and agents target.
+//
+// The selection is the BVA boundary (CLAUDE.md k) for the LB feature:
+//   - LB enabled (more than one server + a DNS domain): the shared LB FQDN
+//     https://<cluster>-api.<domain>:6443 — ONE endpoint that fans out across every server,
+//     cert-valid because that name is in every server's --tls-san (buildRunArgs, HA mode).
+//   - otherwise + a DNS domain: the bootstrap server's own FQDN endpoint (v0.2.0 behaviour).
+//   - otherwise (IP-only): the bootstrap server's current DHCP IP (v0.1.x behaviour).
+//
+// Pure so the endpoint selection is unit-testable without launching anything. cfg.ProvisionAPILB
+// is the same predicate setupAPILB uses, so the endpoint can never point at an LB that was not
+// provisioned (and vice-versa).
+func clusterAPIEndpoint(cfg ClusterConfig, serverName string, serverIP netip.Addr, dnsDomain string) string {
+	switch {
+	case cfg.ProvisionAPILB && dnsDomain != "":
+		return "https://" + net.JoinHostPort(clusterAPIFQDN(cfg.Name, dnsDomain), strconv.Itoa(k3sAPIPort))
+	case dnsDomain != "":
+		return "https://" + net.JoinHostPort(nodeFQDN(serverName, dnsDomain), strconv.Itoa(k3sAPIPort))
+	default:
+		return "https://" + net.JoinHostPort(serverIP.String(), strconv.Itoa(k3sAPIPort))
+	}
+}
+
+// buildAPILBConfig renders the haproxy.cfg for the API load balancer. Pure (config text in
+// strings out) so the recipe is unit-testable without launching a VM — same discipline as
+// buildRunArgs / buildEtcdRunArgs.
+//
+// The config is L4 (mode tcp) passthrough: haproxy never decrypts, so the client verifies the
+// apiserver cert end to end. Backends are each server addressed by FQDN (nodeFQDN), never IP, so
+// they survive the vmnet DHCP shift. Runtime DNS re-resolution makes that survival real:
+//   - `resolvers containerdns parse-resolv-conf` reuses the container's own DNS (the Apple
+//     container resolver that re-registers <node>.<domain> A-records to the new IP on restart);
+//   - each `server` line carries `resolvers containerdns resolve-prefer ipv4` so haproxy re-resolves
+//     the backend FQDN on the `hold valid` TTL (apiLBDNSHoldSeconds) and follows the moved IP;
+//   - `init-addr none` lets haproxy START even if a backend FQDN does not resolve yet at boot
+//     (servers may still be coming up), instead of a fatal startup error.
+//
+// servers must be the server NodeConfigs (RoleServer); callers pass the same slice splitRoles
+// produced. dnsDomain MUST be non-empty (the LB is FQDN-only) — setupAPILB guarantees this.
+func buildAPILBConfig(clusterName string, servers []NodeConfig, dnsDomain string) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "# Generated by k3ac for cluster %q — API load balancer (L4/TCP passthrough).\n", clusterName)
+	b.WriteString("# DO NOT terminate TLS here: the apiserver cert is verified end to end by the client.\n\n")
+
+	b.WriteString("global\n")
+	b.WriteString("    log stdout format raw local0\n")
+	b.WriteString("    maxconn 4096\n\n")
+
+	b.WriteString("defaults\n")
+	b.WriteString("    log     global\n")
+	b.WriteString("    mode    tcp\n")
+	b.WriteString("    option  tcplog\n")
+	b.WriteString("    timeout connect 5s\n")
+	b.WriteString("    timeout client  30s\n")
+	b.WriteString("    timeout server  30s\n\n")
+
+	// parse-resolv-conf: pick up the container's DNS server (Apple container DNS), the same
+	// resolver that re-registers <node>.<domain> after the cold-restart IP shift.
+	b.WriteString("resolvers containerdns\n")
+	b.WriteString("    parse-resolv-conf\n")
+	fmt.Fprintf(&b, "    hold valid %ds\n", apiLBDNSHoldSeconds)
+	fmt.Fprintf(&b, "    hold nx    %ds\n\n", apiLBDNSHoldSeconds)
+
+	fmt.Fprintf(&b, "frontend k3s-api\n    bind *:%d\n    default_backend k3s-servers\n\n", k3sAPIPort)
+
+	b.WriteString("backend k3s-servers\n")
+	b.WriteString("    balance roundrobin\n")
+	b.WriteString("    option tcp-check\n")
+
+	for i, s := range servers {
+		fqdn := nodeFQDN(s.Name, dnsDomain)
+		// resolvers + resolve-prefer ipv4 + init-addr none: re-resolve the backend FQDN at
+		// runtime and tolerate it being unresolvable at boot. check: passive TCP health check.
+		fmt.Fprintf(&b, "    server srv%d %s:%d check resolvers containerdns resolve-prefer ipv4 init-addr none\n",
+			i+1, fqdn, k3sAPIPort)
+	}
+
+	return b.String()
+}
+
+// buildAPILBRunArgs assembles the `container run` vector for the API load-balancer micro-VM.
+// Pure (unit-testable without launching a VM), mirroring buildEtcdRunArgs. It is NOT
+// buildRunArgs: the LB shares none of the k3s recipe (no --cap-add, no tmpfs, no named volume,
+// no k3s subcommand, a different image). It is STATELESS — its only state is the bind-mounted
+// haproxy.cfg, so there is no named volume to create or reclaim. It carries the cluster labels
+// so the destroy label sweep reclaims it even when state.json is absent.
+//
+// configHostDir is the absolute host dir holding the generated haproxy.cfg; it is bind-mounted
+// (read-only) at the haproxy image's default config dir so the image's default CMD loads it. A
+// bind-mount is a virtio-fs share — fine for a plain config file (the same reasoning that makes
+// the kubeconfig bind-mount safe; only the block-backed datastore needs a named volume). dnsDomain
+// MUST be non-empty (the --name is the FQDN container DNS registers); setupAPILB guarantees this.
+func buildAPILBRunArgs(cfg ClusterConfig, dnsDomain, configHostDir string) []string {
+	args := []string{
+		"run", "--detach",
+		"--name", nodeFQDN(apiLBNodeName(cfg.Name), dnsDomain),
+		"--memory", fmt.Sprintf("%dMB", defaultAPILBMemoryBytes/(1024*1024)),
+		"--volume", configHostDir + ":" + apiLBConfigMount + ":ro",
+		"--label", labelOwned + "=true",
+		"--label", labelClusterName + "=" + cfg.Name,
+		"--label", "k3s.role=" + RoleLB.String(),
+	}
+
+	if cfg.Network != "" {
+		args = append(args, "--network", cfg.Network)
+	}
+
+	// Image is the final arg: the haproxy image's default ENTRYPOINT/CMD runs
+	// `haproxy -f <apiLBConfigMount>/haproxy.cfg`, so no trailing subcommand (same shape as
+	// the Postgres datastore, which also relies on its image's default entrypoint).
+	args = append(args, defaultAPILBImage)
 
 	return args
 }

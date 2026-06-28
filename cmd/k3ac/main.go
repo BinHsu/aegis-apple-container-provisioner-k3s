@@ -40,10 +40,13 @@ func run() error {
 		token       = flag.String("token", "", "K3S_TOKEN (empty = generate with crypto/rand)")
 		serverMemMB = flag.Int64("server-memory", 2048, "server memory (MB)")
 		agentMemMB  = flag.Int64("agent-memory", 2048, "agent memory (MB)")
-		serverCount = flag.Int("servers", 1, "number of server (control-plane) nodes (HA, see docs/ADR/0002). "+
-			">1 with no -datastore-endpoint makes k3ac provision a managed Postgres datastore (needs -dns-domain).")
+		serverCount = flag.Int("servers", 1, "number of server (control-plane) nodes (HA, see docs/ADR-0003). "+
+			">1 with no -datastore-endpoint makes k3ac provision a managed etcd cluster (needs -dns-domain).")
 		datastore = flag.String("datastore-endpoint", "", "bring-your-own external k3s datastore for HA, e.g. "+
-			"postgres://user:pass@db.aegis:5432/kine. Empty + -servers>1 = k3ac provisions one; empty + -servers=1 = embedded sqlite.")
+			"postgres://user:pass@db.aegis:5432/kine. Empty + -servers>1 = k3ac provisions a managed etcd cluster; "+
+			"empty + -servers=1 = embedded sqlite.")
+		datastoreMembers = flag.Int("datastore-members", 3, "managed etcd cluster size for the auto-provisioned HA "+
+			"datastore; MUST be odd and >=3 (3 or 5). Ignored with a bring-your-own -datastore-endpoint.")
 		agentCount = flag.Int("agents", 1, "number of agent (worker) nodes")
 		destroy    = flag.Bool("destroy", false, "destroy the named cluster instead of creating it")
 		addAgents  = flag.Int("add-agents", 0, "add N agent nodes to an existing cluster")
@@ -66,7 +69,7 @@ func run() error {
 
 		applyConfig(fc, explicit,
 			clusterName, k3sImage, stateDir, network, dnsDomain,
-			token, datastore, serverMemMB, agentMemMB, serverCount, agentCount)
+			token, datastore, serverMemMB, agentMemMB, serverCount, agentCount, datastoreMembers)
 	}
 
 	ctx := context.Background()
@@ -158,11 +161,18 @@ func run() error {
 		Token:             *token,
 		DatastoreEndpoint: *datastore,
 		// Infer managed-datastore (one-command HA): more than one server and no bring-your-own
-		// endpoint means k3ac provisions a Postgres datastore itself. With an explicit
-		// -datastore-endpoint the operator owns the datastore (BYO). The provider validates the
-		// rest (e.g. managed HA needs -dns-domain).
-		ManageDatastore: *serverCount > 1 && *datastore == "",
-		Nodes:           nodes,
+		// endpoint means k3ac provisions a managed etcd cluster itself (docs/ADR-0003). With an
+		// explicit -datastore-endpoint the operator owns the datastore (BYO). The provider
+		// validates the rest (e.g. managed HA needs -dns-domain; member count must be odd >=3).
+		ManageDatastore:  *serverCount > 1 && *datastore == "",
+		DatastoreMembers: *datastoreMembers,
+		// Infer the API load balancer: more than one server gets a single front-door endpoint
+		// (<cluster>-api.<domain>) so the kubeconfig + agents target one FQDN that fans out across
+		// servers (docs/ADR/0002, v0.3.0). A single server IS the endpoint, so it gets no LB.
+		// setupAPILB further gates on -dns-domain (the LB is FQDN-addressed) and skips gracefully
+		// when absent. The -config JSON path feeds serverCount, so HA-from-config gets the LB too.
+		ProvisionAPILB: *serverCount > 1,
+		Nodes:          nodes,
 	}
 
 	state, err := prov.Create(ctx, cfg, log.Writer())

@@ -23,11 +23,16 @@ type fileConfig struct {
 	Image     string  `json:"image"`
 	Network   string  `json:"network"`
 	Token     string  `json:"token"`
-	// DatastoreEndpoint enables multi-server HA (external datastore; see docs/ADR/0002).
-	// "" = absent → single-server embedded sqlite.
+	// DatastoreEndpoint enables multi-server HA with a bring-your-own external datastore (see
+	// docs/ADR/0002). "" = absent → single-server embedded sqlite, OR the managed etcd path when
+	// Servers>1 (docs/ADR-0003).
 	DatastoreEndpoint string `json:"datastoreEndpoint"`
-	ServerMemoryMB    int64  `json:"serverMemoryMB"`
-	AgentMemoryMB     int64  `json:"agentMemoryMB"`
+	// DatastoreMembers is the managed etcd cluster size (odd, >=3) for the auto-provisioned HA
+	// datastore. 0 = absent → the built-in default (3) stays in effect (see applyConfig). Only
+	// meaningful when Servers>1 and DatastoreEndpoint is empty.
+	DatastoreMembers int   `json:"datastoreMembers"`
+	ServerMemoryMB   int64 `json:"serverMemoryMB"`
+	AgentMemoryMB    int64 `json:"agentMemoryMB"`
 	// Servers: control-plane node count. Unlike Agents, 0 is NOT a valid shape (a cluster
 	// needs at least one server), so absent-from-file (0) leaves the built-in default (1)
 	// in place — see applyConfig. Set "servers": N (with "datastoreEndpoint") for HA.
@@ -77,11 +82,17 @@ func loadFileConfig(path string) (fileConfig, error) {
 //     distinguish absent-from-file from explicitly-zero, the rule is: whenever -config
 //     is supplied and -agents was not set explicitly, the file value (even 0) overrides
 //     the built-in default (1). Include "agents": N in every config file you write.
+//
+// Note (v0.3.0): the positional parameter list is intentionally left as-is rather than refactored
+// into a config struct. The v0.3.0 handoff flagged that refactor, but the API-LB branch this builds
+// on had not done it; the minimal clean change here is one added *int (datastoreMembers). The struct
+// refactor remains a clean follow-up once another field lands.
 func applyConfig(
 	fc fileConfig, explicit map[string]bool,
 	clusterName *string, k3sImage *string, stateDir *string, network *string,
 	dnsDomain *string, token *string, datastore *string,
 	serverMemMB *int64, agentMemMB *int64, serverCount *int, agentCount *int,
+	datastoreMembers *int,
 ) {
 	if !explicit["name"] && fc.Name != "" {
 		*clusterName = fc.Name
@@ -120,6 +131,13 @@ func applyConfig(
 	// leaves the built-in default (1) in place rather than overriding it to 0.
 	if !explicit["servers"] && fc.Servers != 0 {
 		*serverCount = fc.Servers
+	}
+
+	// DatastoreMembers: like Servers, 0 is NOT a valid value (the managed etcd cluster must be
+	// odd and >=3), so absent-from-file (0) keeps the built-in default (3); only a non-zero file
+	// value overrides it. An invalid non-zero value is rejected later by the provider.
+	if !explicit["datastore-members"] && fc.DatastoreMembers != 0 {
+		*datastoreMembers = fc.DatastoreMembers
 	}
 
 	// Agents: always apply from file (even 0) unless the flag was explicitly set.

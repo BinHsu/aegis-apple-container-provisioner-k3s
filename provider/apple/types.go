@@ -18,16 +18,27 @@ const (
 	RoleServer Role = iota
 	// RoleAgent is a k3s agent node (worker; joins via K3S_URL + K3S_TOKEN).
 	RoleAgent
-	// RoleDatastore is the managed external datastore (Postgres) micro-VM that backs an HA
-	// control plane (docs/ADR/0002). It is NOT a k3s node: it never goes through buildRunArgs
-	// or the k3s subcommand path. It is provisioned by Create when ManageDatastore is set and
-	// tracked in ClusterState.Nodes so the teardown label sweep reclaims it.
+	// RoleDatastore is a managed external-datastore micro-VM that backs an HA control plane. As
+	// of v0.3.0 the managed datastore is an N-member etcd cluster (docs/ADR-0003), so MULTIPLE
+	// nodes carry this role — one per etcd member (the single-Postgres path of ADR-0002 is
+	// retired; bring-your-own -datastore-endpoint still accepts Postgres/MySQL/etcd). A
+	// RoleDatastore node is NOT a k3s node: it never goes through buildRunArgs or the k3s
+	// subcommand path. It is provisioned by Create when ManageDatastore is set and tracked in
+	// ClusterState.Nodes so the teardown label sweep reclaims it.
 	RoleDatastore
+	// RoleLB is the API-server load balancer micro-VM (haproxy mode tcp) that fronts the HA
+	// control plane at the shared FQDN <cluster>-api.<domain> (docs/ADR/0002, v0.3.0). Like
+	// RoleDatastore it is NOT a k3s node: it never goes through buildRunArgs or the k3s
+	// subcommand path. It is provisioned by Create when ProvisionAPILB is set (more than one
+	// server) and tracked in ClusterState.Nodes so the teardown label sweep reclaims it. It is
+	// stateless (no named volume): its only config is an haproxy.cfg delivered via host
+	// bind-mount, regenerated on every create.
+	RoleLB
 )
 
 // String renders the role. For server/agent it is the k3s subcommand appended to
-// `container run ... <image> <role>`; "datastore" is a label value only (a RoleDatastore
-// node never reaches the k3s subcommand path).
+// `container run ... <image> <role>`; "datastore" and "lb" are label values only (a
+// RoleDatastore / RoleLB node never reaches the k3s subcommand path).
 func (r Role) String() string {
 	switch r {
 	case RoleServer:
@@ -36,6 +47,8 @@ func (r Role) String() string {
 		return "agent"
 	case RoleDatastore:
 		return "datastore"
+	case RoleLB:
+		return "lb"
 	default:
 		return "unknown"
 	}
@@ -65,21 +78,36 @@ type ClusterConfig struct {
 	// Token is the shared K3S_TOKEN. Generated with crypto/rand if empty (see token.go).
 	Token string
 	// DatastoreEndpoint, when non-empty, is the k3s --datastore-endpoint for an EXTERNAL
-	// network datastore (e.g. postgres://user:pass@db.aegis:5432/kine). It switches the
-	// cluster into multi-server HA mode: every server runs stateless against this shared
-	// datastore — no embedded etcd (etcd's IP-bound peer membership cannot survive the
-	// vmnet DHCP IP shift; see docs/ADR/0002). Empty = single-server embedded sqlite
-	// (v0.1.x), UNLESS ManageDatastore asks Create to provision one. validateClusterConfig
-	// requires either this or ManageDatastore whenever Nodes has >1 server.
+	// network datastore — bring-your-own (e.g. postgres://user:pass@db.aegis:5432/kine, or a
+	// comma-separated etcd client URL list). It switches the cluster into multi-server HA mode:
+	// every server runs stateless against this shared datastore — no EMBEDDED etcd (embedded
+	// etcd's IP-bound peer membership cannot survive the vmnet DHCP IP shift; see docs/ADR/0002).
+	// The managed HA path (ManageDatastore) instead auto-provisions an EXTERNAL etcd cluster whose
+	// members are FQDN-addressed and so DO survive the shift (docs/ADR-0003). Empty = single-server
+	// embedded sqlite (v0.1.x), UNLESS ManageDatastore asks Create to provision one.
+	// validateClusterConfig requires either this or ManageDatastore whenever Nodes has >1 server.
 	DatastoreEndpoint string
-	// ManageDatastore asks Create to provision a managed Postgres datastore micro-VM (the
-	// one-command HA path) and fill DatastoreEndpoint automatically. Requires a DNS domain
-	// (HA needs a stable FQDN for the datastore endpoint). Ignored when DatastoreEndpoint is
-	// already set (bring-your-own datastore). The managed node's image and memory are fixed
-	// defaults (see node.go defaultDatastoreImage / defaultDatastoreMemoryBytes).
+	// ManageDatastore asks Create to provision a managed etcd cluster (the one-command HA path,
+	// docs/ADR-0003) and fill DatastoreEndpoint automatically. Requires a DNS domain (every etcd
+	// member and every server addresses the others by stable FQDN). Ignored when DatastoreEndpoint
+	// is already set (bring-your-own datastore). The members' image and memory are fixed defaults
+	// (see node.go defaultEtcdImage / defaultEtcdMemoryBytes).
 	ManageDatastore bool
+	// DatastoreMembers is the managed etcd cluster size. MUST be odd and ≥3 (3 or 5);
+	// validateEtcdMemberCount enforces that. 0 means "use defaultEtcdMembers" (3). Only meaningful
+	// with ManageDatastore (a bring-your-own DatastoreEndpoint ignores it).
+	DatastoreMembers int
+	// ProvisionAPILB asks Create to provision an API-server load balancer micro-VM (haproxy
+	// mode tcp) at the shared FQDN <cluster>-api.<domain>, and to point the kubeconfig + agents
+	// at that one endpoint instead of the bootstrap server (docs/ADR/0002, v0.3.0). It is
+	// meaningful only with more than one server (a single server IS the endpoint) and requires a
+	// DNS domain (the LB is FQDN-addressed and the cert SAN <cluster>-api.<domain> exists only in
+	// FQDN mode). The cmd driver infers it as serverCount > 1; setupAPILB gates it on the DNS
+	// domain and skips gracefully (no LB, keep pointing at the bootstrap server) when absent. The
+	// LB node is NOT listed in Nodes — Create provisions it separately.
+	ProvisionAPILB bool
 	// Nodes are the nodes to launch (server first is enforced by Create's ordering). The
-	// managed datastore is NOT listed here — Create provisions it separately.
+	// managed datastore and the API LB are NOT listed here — Create provisions them separately.
 	Nodes []NodeConfig
 }
 
