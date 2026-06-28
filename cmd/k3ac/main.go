@@ -162,7 +162,13 @@ func run() error {
 		// -datastore-endpoint the operator owns the datastore (BYO). The provider validates the
 		// rest (e.g. managed HA needs -dns-domain).
 		ManageDatastore: *serverCount > 1 && *datastore == "",
-		Nodes:           nodes,
+		// Infer the API load balancer: more than one server gets a single front-door endpoint
+		// (<cluster>-api.<domain>) so the kubeconfig + agents target one FQDN that fans out across
+		// servers (docs/ADR/0002, v0.3.0). A single server IS the endpoint, so it gets no LB.
+		// setupAPILB further gates on -dns-domain (the LB is FQDN-addressed) and skips gracefully
+		// when absent. The -config JSON path feeds serverCount, so HA-from-config gets the LB too.
+		ProvisionAPILB: *serverCount > 1,
+		Nodes:          nodes,
 	}
 
 	state, err := prov.Create(ctx, cfg, log.Writer())

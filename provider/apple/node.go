@@ -40,6 +40,29 @@ const (
 	defaultDatastoreMemoryBytes = 1024 * 1024 * 1024                // 1 GiB
 )
 
+// API load balancer (RoleLB) recipe constants. The LB is one stateless micro-VM running
+// haproxy in TCP (L4) passthrough mode in front of the HA servers' apiserver port (6443).
+//
+// WHY haproxy mode tcp (not nginx stream, not an L7 proxy): the apiserver speaks mutual TLS
+// and the kubeconfig must verify the apiserver cert END TO END, so the LB must NOT terminate
+// TLS — it forwards raw TCP. Both haproxy `mode tcp` and nginx `stream {}` do L4 passthrough,
+// but this substrate's defining constraint is the vmnet DHCP IP shift on cold restart, so the
+// LB must RE-RESOLVE its backend FQDNs at runtime (not just once at startup). Open-source
+// haproxy has mature runtime DNS re-resolution — a `resolvers` section with `parse-resolv-conf`
+// (reuse the same container DNS that re-registers <node>.<domain> A-records) plus per-server
+// `resolvers`/`resolve-prefer ipv4` — so a backend that moves to a new DHCP IP is picked up
+// within the `hold` TTL. Open-source nginx re-resolves stream upstreams only via the commercial
+// `resolve` parameter (or a single-backend `proxy_pass $var` hack that loses multi-backend
+// balancing), so haproxy is the better fit for surviving the IP shift here.
+const (
+	defaultAPILBImage       = "haproxy:3.0-alpine"     // 3.0 is an LTS; >=2.1 needed for `parse-resolv-conf`
+	apiLBConfigMount        = "/usr/local/etc/haproxy" // haproxy image's default config dir (default CMD reads haproxy.cfg here)
+	apiLBConfigFileName     = "haproxy.cfg"            // the file the default CMD loads
+	apiLBConfigSubdir       = "lb"                     // subdir under the cluster state dir holding the generated haproxy.cfg
+	defaultAPILBMemoryBytes = 256 * 1024 * 1024        // 256 MiB — a TCP passthrough proxy is light
+	apiLBDNSHoldSeconds     = 10                       // backend-FQDN resolution TTL; bounds how fast a shifted DHCP IP is picked up
+)
+
 // kubeconfigMount is the in-node mount point for a HOST bind-mount of the cluster state
 // dir on the server node. k3s writes its admin kubeconfig here (--write-kubeconfig
 // kubeconfigMount/kubeconfigFileName) and Create reads it straight off the host
@@ -109,11 +132,21 @@ func nodeFQDN(nodeName, domain string) string {
 
 // clusterAPIFQDN returns the shared HA API endpoint name <cluster>-api.<domain>. It is added
 // to every server's --tls-san in HA mode (see buildRunArgs) so a single kubeconfig endpoint
-// and a future API load balancer are cert-valid against any server. It is NOT a container
-// name, so container DNS does not auto-register it — wiring it as the live endpoint is the
-// load-balancer step deferred in docs/ADR/0002.
+// and the API load balancer are cert-valid against any server. As of v0.3.0 it IS a live
+// container name: the RoleLB micro-VM is launched with --name == this FQDN, so container DNS
+// auto-registers it to the LB's IP (and re-registers on the cold-restart shift, like any node).
+// It is identical to nodeFQDN(apiLBNodeName(clusterName), domain) — the single source of truth
+// is kept here because the --tls-san wiring predates the LB node.
 func clusterAPIFQDN(clusterName, domain string) string {
 	return clusterName + "-api." + domain
+}
+
+// apiLBNodeName is the bare name of the API load-balancer node: <cluster>-api. Its FQDN
+// (apiLBNodeName + "." + domain) equals clusterAPIFQDN and is both the container --name and the
+// host that the kubeconfig + agents target, so container DNS re-registers it to the new IP on a
+// cold restart — the same FQDN mechanism that stabilizes every other endpoint (ADR-0001).
+func apiLBNodeName(clusterName string) string {
+	return clusterName + "-api"
 }
 
 // datastoreNodeName is the bare name of the managed datastore node: <cluster>-db. The FQDN
@@ -168,6 +201,122 @@ func buildDatastoreRunArgs(cfg ClusterConfig, password, dnsDomain string) []stri
 	}
 
 	args = append(args, defaultDatastoreImage)
+
+	return args
+}
+
+// clusterAPIEndpoint returns the stable https URL the kubeconfig and agents target.
+//
+// The selection is the BVA boundary (CLAUDE.md k) for the LB feature:
+//   - LB enabled (more than one server + a DNS domain): the shared LB FQDN
+//     https://<cluster>-api.<domain>:6443 — ONE endpoint that fans out across every server,
+//     cert-valid because that name is in every server's --tls-san (buildRunArgs, HA mode).
+//   - otherwise + a DNS domain: the bootstrap server's own FQDN endpoint (v0.2.0 behaviour).
+//   - otherwise (IP-only): the bootstrap server's current DHCP IP (v0.1.x behaviour).
+//
+// Pure so the endpoint selection is unit-testable without launching anything. cfg.ProvisionAPILB
+// is the same predicate setupAPILB uses, so the endpoint can never point at an LB that was not
+// provisioned (and vice-versa).
+func clusterAPIEndpoint(cfg ClusterConfig, serverName string, serverIP netip.Addr, dnsDomain string) string {
+	switch {
+	case cfg.ProvisionAPILB && dnsDomain != "":
+		return "https://" + net.JoinHostPort(clusterAPIFQDN(cfg.Name, dnsDomain), strconv.Itoa(k3sAPIPort))
+	case dnsDomain != "":
+		return "https://" + net.JoinHostPort(nodeFQDN(serverName, dnsDomain), strconv.Itoa(k3sAPIPort))
+	default:
+		return "https://" + net.JoinHostPort(serverIP.String(), strconv.Itoa(k3sAPIPort))
+	}
+}
+
+// buildAPILBConfig renders the haproxy.cfg for the API load balancer. Pure (config text in
+// strings out) so the recipe is unit-testable without launching a VM — same discipline as
+// buildRunArgs / buildDatastoreRunArgs.
+//
+// The config is L4 (mode tcp) passthrough: haproxy never decrypts, so the client verifies the
+// apiserver cert end to end. Backends are each server addressed by FQDN (nodeFQDN), never IP, so
+// they survive the vmnet DHCP shift. Runtime DNS re-resolution makes that survival real:
+//   - `resolvers containerdns parse-resolv-conf` reuses the container's own DNS (the Apple
+//     container resolver that re-registers <node>.<domain> A-records to the new IP on restart);
+//   - each `server` line carries `resolvers containerdns resolve-prefer ipv4` so haproxy re-resolves
+//     the backend FQDN on the `hold valid` TTL (apiLBDNSHoldSeconds) and follows the moved IP;
+//   - `init-addr none` lets haproxy START even if a backend FQDN does not resolve yet at boot
+//     (servers may still be coming up), instead of a fatal startup error.
+//
+// servers must be the server NodeConfigs (RoleServer); callers pass the same slice splitRoles
+// produced. dnsDomain MUST be non-empty (the LB is FQDN-only) — setupAPILB guarantees this.
+func buildAPILBConfig(clusterName string, servers []NodeConfig, dnsDomain string) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "# Generated by k3ac for cluster %q — API load balancer (L4/TCP passthrough).\n", clusterName)
+	b.WriteString("# DO NOT terminate TLS here: the apiserver cert is verified end to end by the client.\n\n")
+
+	b.WriteString("global\n")
+	b.WriteString("    log stdout format raw local0\n")
+	b.WriteString("    maxconn 4096\n\n")
+
+	b.WriteString("defaults\n")
+	b.WriteString("    log     global\n")
+	b.WriteString("    mode    tcp\n")
+	b.WriteString("    option  tcplog\n")
+	b.WriteString("    timeout connect 5s\n")
+	b.WriteString("    timeout client  30s\n")
+	b.WriteString("    timeout server  30s\n\n")
+
+	// parse-resolv-conf: pick up the container's DNS server (Apple container DNS), the same
+	// resolver that re-registers <node>.<domain> after the cold-restart IP shift.
+	b.WriteString("resolvers containerdns\n")
+	b.WriteString("    parse-resolv-conf\n")
+	fmt.Fprintf(&b, "    hold valid %ds\n", apiLBDNSHoldSeconds)
+	fmt.Fprintf(&b, "    hold nx    %ds\n\n", apiLBDNSHoldSeconds)
+
+	fmt.Fprintf(&b, "frontend k3s-api\n    bind *:%d\n    default_backend k3s-servers\n\n", k3sAPIPort)
+
+	b.WriteString("backend k3s-servers\n")
+	b.WriteString("    balance roundrobin\n")
+	b.WriteString("    option tcp-check\n")
+
+	for i, s := range servers {
+		fqdn := nodeFQDN(s.Name, dnsDomain)
+		// resolvers + resolve-prefer ipv4 + init-addr none: re-resolve the backend FQDN at
+		// runtime and tolerate it being unresolvable at boot. check: passive TCP health check.
+		fmt.Fprintf(&b, "    server srv%d %s:%d check resolvers containerdns resolve-prefer ipv4 init-addr none\n",
+			i+1, fqdn, k3sAPIPort)
+	}
+
+	return b.String()
+}
+
+// buildAPILBRunArgs assembles the `container run` vector for the API load-balancer micro-VM.
+// Pure (unit-testable without launching a VM), mirroring buildDatastoreRunArgs. It is NOT
+// buildRunArgs: the LB shares none of the k3s recipe (no --cap-add, no tmpfs, no named volume,
+// no k3s subcommand, a different image). It is STATELESS — its only state is the bind-mounted
+// haproxy.cfg, so there is no named volume to create or reclaim. It carries the cluster labels
+// so the destroy label sweep reclaims it even when state.json is absent.
+//
+// configHostDir is the absolute host dir holding the generated haproxy.cfg; it is bind-mounted
+// (read-only) at the haproxy image's default config dir so the image's default CMD loads it. A
+// bind-mount is a virtio-fs share — fine for a plain config file (the same reasoning that makes
+// the kubeconfig bind-mount safe; only the block-backed datastore needs a named volume). dnsDomain
+// MUST be non-empty (the --name is the FQDN container DNS registers); setupAPILB guarantees this.
+func buildAPILBRunArgs(cfg ClusterConfig, dnsDomain, configHostDir string) []string {
+	args := []string{
+		"run", "--detach",
+		"--name", nodeFQDN(apiLBNodeName(cfg.Name), dnsDomain),
+		"--memory", fmt.Sprintf("%dMB", defaultAPILBMemoryBytes/(1024*1024)),
+		"--volume", configHostDir + ":" + apiLBConfigMount + ":ro",
+		"--label", labelOwned + "=true",
+		"--label", labelClusterName + "=" + cfg.Name,
+		"--label", "k3s.role=" + RoleLB.String(),
+	}
+
+	if cfg.Network != "" {
+		args = append(args, "--network", cfg.Network)
+	}
+
+	// Image is the final arg: the haproxy image's default ENTRYPOINT/CMD runs
+	// `haproxy -f <apiLBConfigMount>/haproxy.cfg`, so no trailing subcommand (same shape as
+	// the Postgres datastore, which also relies on its image's default entrypoint).
+	args = append(args, defaultAPILBImage)
 
 	return args
 }

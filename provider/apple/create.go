@@ -134,8 +134,9 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 	}
 
 	// 3+4) Gate on the bootstrap API server, then deliver the kubeconfig (loopback rewritten to
-	// the FQDN/IP endpoint). Extracted to deliverKubeconfig to keep Create readable.
-	serverURL, err := p.deliverKubeconfig(ctx, server, serverIP, clusterDir, logw)
+	// the stable cluster endpoint — the LB FQDN in HA, else the server). Extracted to
+	// deliverKubeconfig to keep Create readable.
+	serverURL, err := p.deliverKubeconfig(ctx, cfg, server, serverIP, clusterDir, logw)
 	if err != nil {
 		return ClusterState{}, err
 	}
@@ -151,7 +152,19 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 
 	nodes = append(nodes, joinInfos...)
 
-	// 5) Launch AGENT nodes pointed at the server.
+	// 4.6) Provision the API load balancer (multi-server HA only). It fronts every server at the
+	// shared FQDN serverURL already points at, so it must come up before agents join through it.
+	// Extracted to setupAPILB; returns nil when no LB is needed (single server or IP-only mode).
+	lbInfo, err := p.setupAPILB(ctx, cfg, servers, clusterDir, logw)
+	if err != nil {
+		return ClusterState{}, err
+	}
+
+	if lbInfo != nil {
+		nodes = append(nodes, *lbInfo)
+	}
+
+	// 5) Launch AGENT nodes pointed at the server endpoint (the LB FQDN when an LB was provisioned).
 	for _, agent := range agents {
 		fmt.Fprintln(logw, "launching k3s agent", agent.Name, "->", serverURL)
 
@@ -202,11 +215,16 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 
 // deliverKubeconfig gates on the bootstrap k3s API server becoming reachable, then reads the
 // admin kubeconfig k3s wrote to the bind-mounted host dir, rewrites its loopback server address
-// to the stable endpoint (the server FQDN when a DNS domain is set — survives cold-restart IP
-// changes — or the current DHCP IP otherwise), and writes the operator copy. No container cp:
-// readiness is a host-side TLS dial and the kubeconfig arrives via the host bind-mount (ADR-0001).
-// Returns the computed server URL (also used as the agents' K3S_URL).
-func (p *provisioner) deliverKubeconfig(ctx context.Context, server NodeConfig, serverIP netip.Addr, clusterDir string, logw io.Writer) (string, error) {
+// to the stable cluster endpoint, and writes the operator copy. No container cp: readiness is a
+// host-side TLS dial and the kubeconfig arrives via the host bind-mount (ADR-0001).
+//
+// The endpoint is chosen by clusterAPIEndpoint: the shared LB FQDN https://<cluster>-api.<domain>:6443
+// when an API LB will be provisioned (multi-server HA), else the bootstrap server's own FQDN
+// (survives cold-restart IP changes), else the current DHCP IP (IP-only mode). The LB itself is
+// provisioned by Create AFTER this call, but the URL is a stable name the LB registers before
+// Create returns, so the operator copy is valid by the time it is used. Returns the endpoint URL
+// (also used as the agents' K3S_URL).
+func (p *provisioner) deliverKubeconfig(ctx context.Context, cfg ClusterConfig, server NodeConfig, serverIP netip.Addr, clusterDir string, logw io.Writer) (string, error) {
 	kubeconfigSrc := filepath.Join(clusterDir, kubeconfigFileName) // written by k3s via the mount
 	kubeconfigPath := filepath.Join(clusterDir, "kubeconfig")      // operator copy, endpoint rewritten
 
@@ -216,12 +234,7 @@ func (p *provisioner) deliverKubeconfig(ctx context.Context, server NodeConfig, 
 		return "", fmt.Errorf("server %q readiness: %w", server.Name, err)
 	}
 
-	var serverURL string
-	if p.dnsDomain != "" {
-		serverURL = "https://" + net.JoinHostPort(nodeFQDN(server.Name, p.dnsDomain), strconv.Itoa(k3sAPIPort))
-	} else {
-		serverURL = "https://" + net.JoinHostPort(serverIP.String(), strconv.Itoa(k3sAPIPort))
-	}
+	serverURL := clusterAPIEndpoint(cfg, server.Name, serverIP, p.dnsDomain)
 
 	raw, err := os.ReadFile(kubeconfigSrc)
 	if err != nil {
@@ -370,6 +383,89 @@ func (p *provisioner) provisionDatastore(ctx context.Context, cfg ClusterConfig,
 	info := NodeInfo{ID: id, Name: name, Role: RoleDatastore, IPs: []netip.Addr{addr}}
 
 	return info, datastoreEndpointURL(cfg.Name, p.dnsDomain, password), nil
+}
+
+// setupAPILB provisions the API load balancer when one is requested, returning its NodeInfo.
+// It returns (nil, nil) when no LB is needed: a single-server cluster (the server IS the
+// endpoint), or a cluster with no DNS domain (the LB is FQDN-only — its --name and the cert SAN
+// <cluster>-api.<domain> exist only in FQDN mode). A multi-server IP-only cluster (BYO datastore,
+// no -dns-domain) therefore degrades gracefully to pointing at the bootstrap server, matching
+// clusterAPIEndpoint's own gate so the kubeconfig never names an LB that was not provisioned.
+func (p *provisioner) setupAPILB(ctx context.Context, cfg ClusterConfig, servers []NodeConfig, clusterDir string, logw io.Writer) (*NodeInfo, error) {
+	if !cfg.ProvisionAPILB {
+		return nil, nil
+	}
+
+	if p.dnsDomain == "" {
+		fmt.Fprintln(logw, "skipping API load balancer: no DNS domain (the LB is FQDN-addressed); "+
+			"the kubeconfig points at the bootstrap server")
+
+		return nil, nil
+	}
+
+	info, err := p.provisionAPILB(ctx, cfg, servers, clusterDir, logw)
+	if err != nil {
+		return nil, err
+	}
+
+	return &info, nil
+}
+
+// provisionAPILB brings up the API load-balancer micro-VM and returns its NodeInfo. It generates
+// the haproxy.cfg (L4 passthrough across the server FQDNs), writes it to a subdir of the cluster
+// state dir, bind-mounts that subdir into the haproxy container, then waits for the LB to answer.
+// Readiness reuses waitForAPIServer: a TLS handshake to the LB's :6443 is passed straight through
+// to a backend apiserver (mode tcp), so a completed handshake proves the LB is forwarding to a
+// live server end to end — not just that haproxy bound the port. The caller must have ensured
+// p.dnsDomain != "" (the LB is FQDN-only; setupAPILB enforces this).
+func (p *provisioner) provisionAPILB(ctx context.Context, cfg ClusterConfig, servers []NodeConfig, clusterDir string, logw io.Writer) (NodeInfo, error) {
+	name := apiLBNodeName(cfg.Name)
+	id := nodeFQDN(name, p.dnsDomain)
+
+	fmt.Fprintln(logw, "provisioning API load balancer", id)
+
+	configDir, err := writeAPILBConfig(clusterDir, buildAPILBConfig(cfg.Name, servers, p.dnsDomain))
+	if err != nil {
+		return NodeInfo{}, err
+	}
+
+	if _, err := p.run(ctx, buildAPILBRunArgs(cfg, p.dnsDomain, configDir)...); err != nil {
+		return NodeInfo{}, fmt.Errorf("launching API load balancer %q: %w", id, err)
+	}
+
+	addr, err := p.waitForIPv4(ctx, id)
+	if err != nil {
+		return NodeInfo{}, err
+	}
+
+	if err := p.waitForAPIServer(ctx, addr); err != nil {
+		return NodeInfo{}, fmt.Errorf("API load balancer %q readiness: %w", id, err)
+	}
+
+	return NodeInfo{ID: id, Name: name, Role: RoleLB, IPs: []netip.Addr{addr}}, nil
+}
+
+// writeAPILBConfig writes the generated haproxy.cfg into <clusterDir>/<apiLBConfigSubdir> and
+// returns the ABSOLUTE path of that dir, ready to bind-mount into the LB container. Absolute is
+// required: `container` resolves a relative bind source against the container root (same reason
+// Create makes clusterDir absolute for the kubeconfig mount). The config is regenerated on every
+// create, so it is plain host I/O — no named volume, no stale-state guard (the LB is stateless).
+func writeAPILBConfig(clusterDir, config string) (string, error) {
+	dir, err := filepath.Abs(filepath.Join(clusterDir, apiLBConfigSubdir))
+	if err != nil {
+		return "", fmt.Errorf("resolving API LB config dir: %w", err)
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("creating API LB config dir %q: %w", dir, err)
+	}
+
+	path := filepath.Join(dir, apiLBConfigFileName)
+	if err := os.WriteFile(path, []byte(config), 0o644); err != nil { //nolint:gosec // haproxy reads this as a non-root container user; 0644 keeps it readable, it holds no secrets (L4 passthrough config).
+		return "", fmt.Errorf("writing API LB config %q: %w", path, err)
+	}
+
+	return dir, nil
 }
 
 // datastoreReadyTimeout bounds the wait for Postgres to accept TCP connections. The official

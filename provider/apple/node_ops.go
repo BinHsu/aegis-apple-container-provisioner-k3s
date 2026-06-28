@@ -242,19 +242,23 @@ func nextAgentIndex(nodes []NodeInfo, clusterName string) int {
 }
 
 // ensureRemovable is the node-removal guard, extracted from RemoveNode so the decision is
-// unit-testable without any container calls. Two roles may not be removed via -remove-node:
+// unit-testable without any container calls. Three roles may not be removed via -remove-node:
 //   - a server owns the API (and, in single-server mode, the datastore);
-//   - the managed datastore backs the whole control plane.
+//   - the managed datastore backs the whole control plane;
+//   - the API load balancer is the cluster's single API endpoint (the kubeconfig + agents
+//     target its FQDN), so removing it cuts every client off from the control plane.
 //
-// Removing either is a cluster-destroying act, so it belongs to -destroy. Agents are the only
-// removable role. (Removing one of several HA servers is conservatively refused too: the
-// kubeconfig endpoint targets the bootstrap server and there is no API LB yet — docs/ADR/0002.)
+// Removing any of them is a cluster-destroying act, so it belongs to -destroy. Agents are the
+// only removable role. (Removing one of several HA servers is conservatively refused too: there
+// is no per-server drain/rebalance path yet — docs/ADR/0002.)
 func ensureRemovable(node NodeInfo) error {
 	switch node.Role {
 	case RoleServer:
 		return fmt.Errorf("node %q is a cluster server; removing it would break the control plane — use -destroy instead", node.Name)
 	case RoleDatastore:
 		return fmt.Errorf("node %q is the cluster datastore; removing it would destroy the cluster — use -destroy instead", node.Name)
+	case RoleLB:
+		return fmt.Errorf("node %q is the cluster API load balancer; removing it would cut every client off from the API — use -destroy instead", node.Name)
 	}
 
 	return nil

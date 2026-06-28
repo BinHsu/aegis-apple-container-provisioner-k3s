@@ -23,11 +23,19 @@ const (
 	// or the k3s subcommand path. It is provisioned by Create when ManageDatastore is set and
 	// tracked in ClusterState.Nodes so the teardown label sweep reclaims it.
 	RoleDatastore
+	// RoleLB is the API-server load balancer micro-VM (haproxy mode tcp) that fronts the HA
+	// control plane at the shared FQDN <cluster>-api.<domain> (docs/ADR/0002, v0.3.0). Like
+	// RoleDatastore it is NOT a k3s node: it never goes through buildRunArgs or the k3s
+	// subcommand path. It is provisioned by Create when ProvisionAPILB is set (more than one
+	// server) and tracked in ClusterState.Nodes so the teardown label sweep reclaims it. It is
+	// stateless (no named volume): its only config is an haproxy.cfg delivered via host
+	// bind-mount, regenerated on every create.
+	RoleLB
 )
 
 // String renders the role. For server/agent it is the k3s subcommand appended to
-// `container run ... <image> <role>`; "datastore" is a label value only (a RoleDatastore
-// node never reaches the k3s subcommand path).
+// `container run ... <image> <role>`; "datastore" and "lb" are label values only (a
+// RoleDatastore / RoleLB node never reaches the k3s subcommand path).
 func (r Role) String() string {
 	switch r {
 	case RoleServer:
@@ -36,6 +44,8 @@ func (r Role) String() string {
 		return "agent"
 	case RoleDatastore:
 		return "datastore"
+	case RoleLB:
+		return "lb"
 	default:
 		return "unknown"
 	}
@@ -78,8 +88,17 @@ type ClusterConfig struct {
 	// already set (bring-your-own datastore). The managed node's image and memory are fixed
 	// defaults (see node.go defaultDatastoreImage / defaultDatastoreMemoryBytes).
 	ManageDatastore bool
+	// ProvisionAPILB asks Create to provision an API-server load balancer micro-VM (haproxy
+	// mode tcp) at the shared FQDN <cluster>-api.<domain>, and to point the kubeconfig + agents
+	// at that one endpoint instead of the bootstrap server (docs/ADR/0002, v0.3.0). It is
+	// meaningful only with more than one server (a single server IS the endpoint) and requires a
+	// DNS domain (the LB is FQDN-addressed and the cert SAN <cluster>-api.<domain> exists only in
+	// FQDN mode). The cmd driver infers it as serverCount > 1; setupAPILB gates it on the DNS
+	// domain and skips gracefully (no LB, keep pointing at the bootstrap server) when absent. The
+	// LB node is NOT listed in Nodes — Create provisions it separately.
+	ProvisionAPILB bool
 	// Nodes are the nodes to launch (server first is enforced by Create's ordering). The
-	// managed datastore is NOT listed here — Create provisions it separately.
+	// managed datastore and the API LB are NOT listed here — Create provisions them separately.
 	Nodes []NodeConfig
 }
 
