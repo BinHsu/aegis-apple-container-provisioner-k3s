@@ -38,8 +38,8 @@ const k3sManifestsDir = k3sDatastoreMount + "/server/manifests"
 
 // Managed datastore (external etcd cluster) recipe constants. v0.3.0 supersedes ADR-0002's
 // single-Postgres datastore with an auto-provisioned N-node etcd cluster as the default HA
-// datastore (docs/ADR-0003, hardware-verified). Image and memory are fixed defaults for now —
-// tuning flags are a deliberate follow-up, not part of this cut.
+// datastore (docs/ADR-0003, hardware-verified). Image and memory are the DEFAULTS; v0.5.0 exposes
+// them as -datastore-image / -datastore-memory (ClusterConfig.DatastoreImage / DatastoreMemoryBytes).
 const (
 	// defaultEtcdImage is the etcd node image. ADR-0003 VERIFIED: quay.io/coreos/etcd:v3.5.16
 	// forms a 3-member FQDN-addressed cluster under Apple container and survives the cold-restart
@@ -207,15 +207,16 @@ func etcdVolumeName(nodeName string) string {
 }
 
 // etcdMembers builds the NodeConfig list for an N-member etcd cluster. Each carries RoleDatastore
-// (a label-only role — etcd members never reach the k3s subcommand path) and the fixed default
-// memory. The members are NOT part of ClusterConfig.Nodes; Create provisions them separately.
-func etcdMembers(clusterName string, count int) []NodeConfig {
+// (a label-only role — etcd members never reach the k3s subcommand path) and memBytes of memory
+// (the resolved -datastore-memory, v0.5.0; callers pass defaultEtcdMemoryBytes for the default).
+// The members are NOT part of ClusterConfig.Nodes; Create provisions them separately.
+func etcdMembers(clusterName string, count int, memBytes int64) []NodeConfig {
 	members := make([]NodeConfig, count)
 	for i := range members {
 		members[i] = NodeConfig{
 			Name:   etcdNodeName(clusterName, i+1),
 			Role:   RoleDatastore,
-			Memory: defaultEtcdMemoryBytes,
+			Memory: memBytes,
 		}
 	}
 
@@ -226,12 +227,14 @@ func etcdMembers(clusterName string, count int) []NodeConfig {
 // <member-name>=<peer-url> list covering every member, all FQDN-addressed so peer membership is
 // name-bound (not IP-bound) and therefore survives the vmnet DHCP cold-restart shift — the exact
 // failure that ruled out embedded etcd in ADR-0002 but does NOT apply here, because these peers
-// reach each other by name (ADR-0003). The member name matches each member's etcd --name.
+// reach each other by name (ADR-0003). The member name matches each member's etcd --name. Peer URLs
+// are https:// (v0.5.0): the managed quorum now runs over mutual TLS (etcd_tls.go), and the member
+// server cert's FQDN SAN keeps verification valid across the IP shift.
 func etcdInitialCluster(clusterName, domain string, count int) string {
 	parts := make([]string, count)
 	for i := range parts {
 		name := etcdNodeName(clusterName, i+1)
-		peer := "http://" + net.JoinHostPort(nodeFQDN(name, domain), strconv.Itoa(etcdPeerPort))
+		peer := "https://" + net.JoinHostPort(nodeFQDN(name, domain), strconv.Itoa(etcdPeerPort))
 		parts[i] = name + "=" + peer
 	}
 
@@ -241,15 +244,14 @@ func etcdInitialCluster(clusterName, domain string, count int) string {
 // etcdDatastoreEndpoint builds the k3s --datastore-endpoint for the managed etcd cluster: a
 // comma-separated list of every member's FQDN client URL. k3s tries them in order and fails over,
 // so naming all members (not just one) keeps the control plane reachable when any single member is
-// down. Plain http:// — TLS is deferred (ADR-0003; matches ADR-0002's sslmode=disable precedent on
-// the private vmnet).
-//
-// TODO(v0.3.x): etcd peer/client TLS with FQDN SANs + k3s --datastore-cafile/certfile/keyfile.
+// down. https:// (v0.5.0): the managed quorum runs over mutual TLS; the k3s servers present a
+// client cert and verify each member's FQDN-SAN server cert (the FQDN SAN survives the IP shift).
+// The servers are wired with --datastore-cafile/certfile/keyfile in buildRunArgs.
 func etcdDatastoreEndpoint(clusterName, domain string, count int) string {
 	parts := make([]string, count)
 	for i := range parts {
 		host := nodeFQDN(etcdNodeName(clusterName, i+1), domain)
-		parts[i] = "http://" + net.JoinHostPort(host, strconv.Itoa(etcdClientPort))
+		parts[i] = "https://" + net.JoinHostPort(host, strconv.Itoa(etcdClientPort))
 	}
 
 	return strings.Join(parts, ",")
@@ -266,14 +268,28 @@ func etcdDatastoreEndpoint(clusterName, domain string, count int) string {
 // quorum never forms, ADR-0003); the etcd --name (after the image) is the bare member name that
 // --initial-cluster keys on. All peer/client/advertise URLs are FQDNs so membership is name-bound.
 // initialCluster is the shared etcdInitialCluster value (identical for every member).
-func buildEtcdRunArgs(cfg ClusterConfig, node NodeConfig, dnsDomain, initialCluster string) []string {
+//
+// v0.5.0: the quorum runs over mutual TLS. tlsHostDir is the absolute host dir holding this member's
+// bundle (ca.crt/server.crt/server.key, written by writeEtcdTLS); it is bind-mounted read-only at
+// etcdTLSMount and wired into the peer + client TLS flags (etcdTLSFlags). All URLs are https://. The
+// member server cert's FQDN SAN is what keeps TLS valid across the DHCP IP shift.
+func buildEtcdRunArgs(cfg ClusterConfig, node NodeConfig, dnsDomain, initialCluster, tlsHostDir string) []string {
 	fqdn := nodeFQDN(node.Name, dnsDomain)
+
+	image := cfg.DatastoreImage
+	if image == "" {
+		image = defaultEtcdImage
+	}
 
 	args := []string{
 		"run", "--detach",
 		"--name", fqdn, // CONTAINER name == FQDN so container DNS registers the peer (MANDATORY)
 		"--memory", fmt.Sprintf("%dMB", node.Memory/(1024*1024)),
 		"--volume", etcdVolumeName(node.Name) + ":" + etcdDataMount,
+		// etcd TLS bundle (CA + this member's server cert/key) bind-mounted read-only (v0.5.0). A
+		// virtio-fs share is fine for plain cert files (same reasoning as the kubeconfig/haproxy
+		// mounts); only the block-backed etcd data dir needs a named volume.
+		"--volume", tlsHostDir + ":" + etcdTLSMount + ":ro",
 		"--label", labelOwned + "=true",
 		"--label", labelClusterName + "=" + cfg.Name,
 		"--label", "k3s.role=" + RoleDatastore.String(),
@@ -288,19 +304,41 @@ func buildEtcdRunArgs(cfg ClusterConfig, node NodeConfig, dnsDomain, initialClus
 	// so the binary must be named explicitly (a bare --name would otherwise be taken as the
 	// executable). The trailing args are then etcd flags — same shape as a k3s node's
 	// `server`/`agent` subcommand after the image.
-	args = append(args, defaultEtcdImage, etcdBinary,
+	args = append(args, image, etcdBinary,
 		"--name", node.Name, // etcd MEMBER name (bare); must match this member's key in --initial-cluster
 		"--data-dir", etcdDataDir, // subdir of the mount: the ext4 lost+found blocks etcd at the root
-		"--listen-peer-urls", fmt.Sprintf("http://0.0.0.0:%d", etcdPeerPort),
-		"--listen-client-urls", fmt.Sprintf("http://0.0.0.0:%d", etcdClientPort),
-		"--initial-advertise-peer-urls", "http://"+net.JoinHostPort(fqdn, strconv.Itoa(etcdPeerPort)),
-		"--advertise-client-urls", "http://"+net.JoinHostPort(fqdn, strconv.Itoa(etcdClientPort)),
+		"--listen-peer-urls", fmt.Sprintf("https://0.0.0.0:%d", etcdPeerPort),
+		"--listen-client-urls", fmt.Sprintf("https://0.0.0.0:%d", etcdClientPort),
+		"--initial-advertise-peer-urls", "https://"+net.JoinHostPort(fqdn, strconv.Itoa(etcdPeerPort)),
+		"--advertise-client-urls", "https://"+net.JoinHostPort(fqdn, strconv.Itoa(etcdClientPort)),
 		"--initial-cluster", initialCluster,
 		"--initial-cluster-state", "new",
 		"--initial-cluster-token", cfg.Name+"-etcd", // isolates this cluster's quorum from any other on the network
 	)
 
+	// Mutual-TLS flags for the peer and client ports (v0.5.0). Kept in a helper so this recipe stays
+	// readable and the flag set is asserted in one place.
+	args = append(args, etcdTLSFlags()...)
+
 	return args
+}
+
+// etcdTLSFlags returns etcd's peer + client mutual-TLS flags (v0.5.0). Both the peer port (member
+// quorum traffic) and the client port (the k3s servers) serve TLS from this member's server cert and
+// trust the shared CA; the *-client-cert-auth flags force the other side to present a CA-signed cert
+// too (mutual TLS), so an unauthenticated peer or client is rejected. The files resolve under the
+// bind-mounted etcdTLSMount (buildEtcdRunArgs / writeEtcdTLS).
+func etcdTLSFlags() []string {
+	return []string{
+		"--peer-cert-file", etcdTLSMount + "/" + etcdServerCertFile,
+		"--peer-key-file", etcdTLSMount + "/" + etcdServerKeyFile,
+		"--peer-trusted-ca-file", etcdTLSMount + "/" + etcdCACertFile,
+		"--peer-client-cert-auth=true",
+		"--cert-file", etcdTLSMount + "/" + etcdServerCertFile,
+		"--key-file", etcdTLSMount + "/" + etcdServerKeyFile,
+		"--trusted-ca-file", etcdTLSMount + "/" + etcdCACertFile,
+		"--client-cert-auth=true",
+	}
 }
 
 // clusterAPIEndpoint returns the stable https URL the kubeconfig and agents target.
@@ -501,6 +539,16 @@ func buildRunArgs(cfg ClusterConfig, node NodeConfig, serverURL, dnsDomain, kube
 		args = append(args, manifestMountArgs(cfg.Manifests)...)
 	}
 
+	// DATASTORE TLS (v0.5.0): EVERY server (bootstrap AND HA join, unlike the bootstrap-only
+	// kubeconfig mount) bind-mounts the client TLS bundle (ca.crt/client.crt/client.key) read-only
+	// so it reaches the managed etcd quorum over mutual TLS. Set only when Create generated a
+	// managed-etcd bundle (cfg.DatastoreTLSDir); a bring-your-own datastore endpoint leaves it empty
+	// (the operator owns that connection's TLS). The matching --datastore-*file flags are added in
+	// the server-flags section below.
+	if node.Role == RoleServer && cfg.DatastoreTLSDir != "" {
+		args = append(args, "--volume", cfg.DatastoreTLSDir+":"+etcdTLSMount+":ro")
+	}
+
 	// Labels: k3s.* replacing the Talos sibling's talos.* scheme. Node IDs are also
 	// tracked in state.json so teardown does not depend on label-listing (the CLI does
 	// not support native label filters — Talos sibling finding). Labels on containers and
@@ -522,6 +570,12 @@ func buildRunArgs(cfg ClusterConfig, node NodeConfig, serverURL, dnsDomain, kube
 	// DHCP IP is used.
 	if node.Role == RoleAgent {
 		args = append(args, "--env", "K3S_URL="+serverURL)
+	}
+
+	// ENV INJECTION (v0.5.0): operator-supplied KEY=VALUE env vars (-env, repeatable) added as
+	// --env flags on every k3s node, alongside the built-in K3S_TOKEN/K3S_URL. Empty = none.
+	for _, env := range cfg.EnvVars {
+		args = append(args, "--env", env)
 	}
 
 	if cfg.Network != "" {
@@ -555,6 +609,18 @@ func buildRunArgs(cfg ClusterConfig, node NodeConfig, serverURL, dnsDomain, kube
 		// v0.1.x. validateClusterConfig guarantees an endpoint is present for >1 server.
 		if cfg.DatastoreEndpoint != "" {
 			args = append(args, "--datastore-endpoint="+cfg.DatastoreEndpoint)
+		}
+
+		// k3s datastore client TLS (v0.5.0): point k3s at the bind-mounted client bundle so it
+		// presents a client cert and verifies each etcd member's FQDN-SAN server cert. Paired with the
+		// https:// --datastore-endpoint (etcdDatastoreEndpoint). Managed-etcd path only — empty for a
+		// bring-your-own endpoint, which carries its own TLS params in the endpoint string.
+		if cfg.DatastoreTLSDir != "" {
+			args = append(args,
+				"--datastore-cafile="+etcdTLSMount+"/"+etcdCACertFile,
+				"--datastore-certfile="+etcdTLSMount+"/"+etcdClientCertFile,
+				"--datastore-keyfile="+etcdTLSMount+"/"+etcdClientKeyFile,
+			)
 		}
 
 		// Write the admin kubeconfig to the bind-mounted host dir (mode 0644 so the host

@@ -104,11 +104,16 @@ NXDOMAIN each other and quorum never forms.
 
 ### Limits and watch items
 
-- **TLS is deferred (not dropped).** etcd runs over plain HTTP on the private vmnet for now,
-  matching ADR-0002's `sslmode=disable` precedent. k3s supports
-  `--datastore-cafile/--datastore-certfile/--datastore-keyfile` and etcd supports peer/client
-  TLS; harden with FQDN-SAN certs before any non-spike use.
-  `// TODO(v0.3.x): etcd peer/client TLS with FQDN SANs + k3s --datastore-cafile/certfile/keyfile`.
+- **TLS — implemented in v0.5.0.** The managed etcd quorum now runs over mutual TLS. k3ac generates
+  (host-side `crypto/x509`, stdlib only) one CA, a server cert per member whose SAN includes the
+  member FQDN `<cluster>-etcd-<i>.<domain>` + `localhost` + `127.0.0.1`, and a client cert for the
+  k3s servers; the FQDN SAN is what keeps verification valid across the DHCP IP shift. The bundle is
+  delivered by the same host bind-mount the kubeconfig/haproxy.cfg use (ADR-0001), never container
+  cp. etcd runs with `--peer-cert-file/--peer-key-file/--peer-trusted-ca-file --peer-client-cert-auth`
+  and `--cert-file/--key-file/--trusted-ca-file --client-cert-auth`; the k3s servers run with
+  `--datastore-cafile/--datastore-certfile/--datastore-keyfile` against the `https://` endpoint. See
+  `provider/apple/etcd_tls.go`. (Superseded the earlier "TLS deferred / plain HTTP" stance and the
+  `// TODO(v0.3.x)` in `node.go`.)
 - **Resource cost.** Three etcd micro-VMs (512 MiB each here) plus the k3s servers. Datastore
   HA trades memory for fault tolerance vs ADR-0002's single Postgres VM.
 - **etcd data-dir must be a subdir of the mount** (`--data-dir /data/etcd`): an ext4 named

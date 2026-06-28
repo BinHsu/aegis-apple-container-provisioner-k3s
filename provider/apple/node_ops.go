@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/netip"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -31,8 +33,10 @@ import (
 //	  -> assertDistinctIPs -> saveState
 //
 // agentMemBytes is in bytes and agentNanoCPUs in nano-CPUs, matching NodeConfig and
-// the units the create path passes.
-func (p *provisioner) AddAgents(ctx context.Context, stateDir, clusterName string, count int, agentMemBytes, agentNanoCPUs int64, logw io.Writer) (ClusterState, error) {
+// the units the create path passes. labels (-node-label) and extraArgs (-k3s-agent-arg) are
+// threaded onto each new agent (v0.5.0) so a post-create agent is configured exactly like a
+// create-time one; both were create-only before. Empty slices = none.
+func (p *provisioner) AddAgents(ctx context.Context, stateDir, clusterName string, count int, agentMemBytes, agentNanoCPUs int64, labels, extraArgs []string, logw io.Writer) (ClusterState, error) {
 	if logw == nil {
 		logw = io.Discard
 	}
@@ -74,10 +78,12 @@ func (p *provisioner) AddAgents(ctx context.Context, stateDir, clusterName strin
 	agents := make([]NodeConfig, count)
 	for i := range agents {
 		agents[i] = NodeConfig{
-			Name:     fmt.Sprintf("%s-agent-%d", clusterName, idx+i),
-			Role:     RoleAgent,
-			Memory:   agentMemBytes,
-			NanoCPUs: agentNanoCPUs,
+			Name:      fmt.Sprintf("%s-agent-%d", clusterName, idx+i),
+			Role:      RoleAgent,
+			Memory:    agentMemBytes,
+			NanoCPUs:  agentNanoCPUs,
+			Labels:    labels,
+			ExtraArgs: extraArgs,
 		}
 	}
 
@@ -119,6 +125,171 @@ func (p *provisioner) AddAgents(ctx context.Context, stateDir, clusterName strin
 	}
 
 	return state, nil
+}
+
+// AddServer launches ANOTHER control-plane server, joins it to the cluster's existing external
+// datastore, and re-points the API load balancer at the larger server set (v0.5.0). It mirrors
+// AddAgents' structure, with two HA-specific extras: the new server runs stateless against
+// state.DatastoreEndpoint (no --cluster-init, like Create's HA join servers), and the LB's static
+// backend list is regenerated + reloaded so traffic actually reaches the new server.
+//
+//	LoadState -> ensureAddServerable (HA + LB guard) -> nextServerIndex
+//	  -> prepareNodeVolumes -> launchNode(join) -> enableIPForward -> waitForAPIServer
+//	  -> append to state -> refreshAPILB (regenerate haproxy.cfg + restart LB) -> saveState
+//
+// serverMemBytes is in bytes, serverNanoCPUs in nano-CPUs (matching NodeConfig); labels
+// (-node-label) and extraArgs (-k3s-server-arg) configure the new server like a create-time one.
+func (p *provisioner) AddServer(ctx context.Context, stateDir, clusterName string, serverMemBytes, serverNanoCPUs int64, labels, extraArgs []string, logw io.Writer) (ClusterState, error) {
+	if logw == nil {
+		logw = io.Discard
+	}
+
+	state, err := LoadState(stateDir, clusterName)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return ClusterState{}, fmt.Errorf("cluster %q not found; create it first", clusterName)
+		}
+
+		return ClusterState{}, err
+	}
+
+	// Guard (pure, unit-testable): -add-server needs an external datastore to join AND an existing
+	// API LB to update. Refuse otherwise — there is nothing coherent to add a server to.
+	if err := ensureAddServerable(state); err != nil {
+		return ClusterState{}, err
+	}
+
+	image := state.Image
+	if image == "" {
+		image = defaultK3sImage
+	}
+
+	clusterDir, err := ensureClusterDir(stateDir, clusterName)
+	if err != nil {
+		return ClusterState{}, err
+	}
+
+	// Synthesize the join server's ClusterConfig from saved state. DatastoreTLSDir is re-pointed at
+	// the client bundle Create wrote on disk (managed-etcd-TLS clusters), so the new server reaches
+	// etcd with the SAME client cert the existing servers use; a bring-your-own cluster gets "".
+	cfg := ClusterConfig{
+		Name:              clusterName,
+		Image:             image,
+		Network:           state.Network,
+		StateDir:          stateDir,
+		Token:             state.Token,
+		DatastoreEndpoint: state.DatastoreEndpoint,
+		DatastoreTLSDir:   existingDatastoreTLSDir(clusterDir),
+	}
+
+	idx := nextServerIndex(state.Nodes, clusterName)
+	server := NodeConfig{
+		Name:      fmt.Sprintf("%s-server-%d", clusterName, idx),
+		Role:      RoleServer,
+		Memory:    serverMemBytes,
+		NanoCPUs:  serverNanoCPUs,
+		Labels:    labels,
+		ExtraArgs: extraArgs,
+	}
+
+	createVolume := func(ctx context.Context, name string) error {
+		return p.volumeCreate(ctx, name, volumeLabels(clusterName)...)
+	}
+
+	if err := prepareNodeVolumes(ctx, clusterName, []NodeConfig{server}, p.volumeExists, createVolume); err != nil {
+		return ClusterState{}, err
+	}
+
+	fmt.Fprintln(logw, "adding k3s server", server.Name, "(HA, shared datastore)")
+
+	// Join server: no kubeconfig mount (the bootstrap server already delivered it), so readiness is
+	// the host-side TLS dial only — same as Create's launchJoinServers.
+	info, err := p.launchNode(ctx, cfg, server, "", "")
+	if err != nil {
+		return ClusterState{}, err
+	}
+
+	if err := p.enableIPForward(ctx, info.ID); err != nil {
+		return ClusterState{}, fmt.Errorf("server %q: %w", server.Name, err)
+	}
+
+	if err := p.waitForAPIServer(ctx, info.IPs[0]); err != nil {
+		return ClusterState{}, fmt.Errorf("server %q readiness: %w", server.Name, err)
+	}
+
+	state.Nodes = append(state.Nodes, info)
+
+	// Re-point the API LB at the now-larger server set. ensureAddServerable guaranteed an LB exists.
+	if err := p.refreshAPILB(ctx, clusterDir, &state, logw); err != nil {
+		return ClusterState{}, err
+	}
+
+	if err := assertDistinctIPs(state.Nodes); err != nil {
+		return ClusterState{}, err
+	}
+
+	if err := saveState(state); err != nil {
+		return ClusterState{}, err
+	}
+
+	return state, nil
+}
+
+// refreshAPILB regenerates the haproxy.cfg from the cluster's CURRENT server set (read from state)
+// and restarts the LB container so haproxy reloads it. The backend list is static (one `server`
+// line per FQDN), so a new server is invisible to the LB until the config is regenerated — this is
+// the load-bearing half of AddServer. A cold restart shifts the LB's DHCP IP; clusterAPIFQDN
+// re-registers, so the kubeconfig endpoint is unaffected. The restarted LB's new IP is written back
+// into state. Mutates state in place (updates the LB node's recorded IP).
+func (p *provisioner) refreshAPILB(ctx context.Context, clusterDir string, state *ClusterState, logw io.Writer) error {
+	lbIdx := -1
+
+	for i, n := range state.Nodes {
+		if n.Role == RoleLB {
+			lbIdx = i
+
+			break
+		}
+	}
+
+	if lbIdx < 0 {
+		return fmt.Errorf("cluster %q: no API load balancer node to update", state.ClusterName)
+	}
+
+	servers := serverConfigsFromState(state.Nodes)
+
+	fmt.Fprintf(logw, "regenerating API load balancer config for %d servers\n", len(servers))
+
+	if _, err := writeAPILBConfig(clusterDir, buildAPILBConfig(state.ClusterName, servers, p.dnsDomain)); err != nil {
+		return err
+	}
+
+	lb := state.Nodes[lbIdx]
+
+	fmt.Fprintln(logw, "restarting API load balancer", lb.ID, "to reload config")
+
+	if err := p.stop(ctx, lb.ID); err != nil {
+		return err
+	}
+
+	if err := p.start(ctx, lb.ID); err != nil {
+		return err
+	}
+
+	addr, err := p.waitForIPv4(ctx, lb.ID)
+	if err != nil {
+		return err
+	}
+
+	// A completed TLS handshake through the LB proves it forwards to a live server end to end (mode
+	// tcp passthrough), i.e. the reloaded backend list works.
+	if err := p.waitForAPIServer(ctx, addr); err != nil {
+		return fmt.Errorf("API load balancer %q readiness after reload: %w", lb.ID, err)
+	}
+
+	state.Nodes[lbIdx].IPs = []netip.Addr{addr}
+
+	return nil
 }
 
 // RemoveNode tears down a single node and removes it from the cluster's saved state.
@@ -218,8 +389,22 @@ func (p *provisioner) drainNode(ctx context.Context, stateDir, clusterName, node
 // agents always get a fresh, unused index, so a recreated agent never reuses a name whose
 // stale datastore volume might still linger.
 func nextAgentIndex(nodes []NodeInfo, clusterName string) int {
-	prefix := clusterName + "-agent-"
+	return nextIndexForPrefix(nodes, clusterName+"-agent-")
+}
 
+// nextServerIndex is the server equivalent of nextAgentIndex: max existing
+// <clusterName>-server-<N> + 1 (or 1 when none). Drives AddServer's new-server naming so a
+// re-added server never collides with a current one or reuses a name whose stale k3s datastore
+// volume might linger. Pure (BVA on the server set), like nextAgentIndex.
+func nextServerIndex(nodes []NodeInfo, clusterName string) int {
+	return nextIndexForPrefix(nodes, clusterName+"-server-")
+}
+
+// nextIndexForPrefix returns max existing <prefix><N> suffix + 1 (or 1 when none match). Names
+// that do not carry the prefix, or whose suffix is non-numeric, are ignored. The shared core of
+// nextAgentIndex / nextServerIndex so the "fresh index, never backfill a gap" rule is identical
+// for both roles.
+func nextIndexForPrefix(nodes []NodeInfo, prefix string) int {
 	highest := 0
 
 	for _, n := range nodes {
@@ -230,7 +415,7 @@ func nextAgentIndex(nodes []NodeInfo, clusterName string) int {
 
 		idx, err := strconv.Atoi(suffix)
 		if err != nil {
-			continue // non-numeric suffix: not one of our generated agent names
+			continue // non-numeric suffix: not one of our generated node names
 		}
 
 		if idx > highest {
@@ -262,6 +447,65 @@ func ensureRemovable(node NodeInfo) error {
 	}
 
 	return nil
+}
+
+// ensureAddServerable guards -add-server (pure, unit-testable without container calls). It requires
+// (1) an external datastore endpoint — a single-server sqlite cluster has no shared store for a
+// second server to join — and (2) an existing API load balancer node to re-point at the larger
+// server set. Both are "the cluster has no HA/LB context"; without them -add-server has nothing
+// coherent to do. An IP-only multi-server cluster (no DNS domain, so setupAPILB skipped the LB)
+// hits guard (2): recreate it with -dns-domain to get an LB.
+func ensureAddServerable(state ClusterState) error {
+	if state.DatastoreEndpoint == "" {
+		return fmt.Errorf("cluster %q is single-server (no external datastore); -add-server needs an HA "+
+			"cluster — recreate with -servers>=2 (or a bring-your-own -datastore-endpoint)", state.ClusterName)
+	}
+
+	if !hasLBNode(state.Nodes) {
+		return fmt.Errorf("cluster %q has no API load balancer to update; -add-server requires an HA "+
+			"cluster created with a DNS domain (the LB is FQDN-addressed)", state.ClusterName)
+	}
+
+	return nil
+}
+
+// hasLBNode reports whether the recorded nodes include the API load balancer (RoleLB).
+func hasLBNode(nodes []NodeInfo) bool {
+	for _, n := range nodes {
+		if n.Role == RoleLB {
+			return true
+		}
+	}
+
+	return false
+}
+
+// serverConfigsFromState extracts the RoleServer nodes from recorded state as NodeConfigs (Name +
+// Role — all buildAPILBConfig needs), preserving order. The single source of truth for the LB
+// backend set on AddServer, so the regenerated haproxy.cfg lists exactly the servers in state.
+func serverConfigsFromState(nodes []NodeInfo) []NodeConfig {
+	var servers []NodeConfig
+
+	for _, n := range nodes {
+		if n.Role == RoleServer {
+			servers = append(servers, NodeConfig{Name: n.Name, Role: RoleServer})
+		}
+	}
+
+	return servers
+}
+
+// existingDatastoreTLSDir returns the absolute client-TLS dir Create wrote for a managed-etcd
+// cluster (<clusterDir>/etcd-tls/client) when it exists on disk, else "". AddServer threads it so a
+// new server reaches the TLS datastore with the SAME client bundle the original servers use; a
+// bring-your-own datastore cluster has no such dir and gets "" (plain connection).
+func existingDatastoreTLSDir(clusterDir string) string {
+	dir := filepath.Join(clusterDir, etcdTLSSubdir, etcdClientSubdir)
+	if info, err := os.Stat(dir); err == nil && info.IsDir() {
+		return dir
+	}
+
+	return ""
 }
 
 // nodeNames returns the bare names of nodes, for the "available nodes" hint in

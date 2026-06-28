@@ -96,15 +96,27 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		}
 	}
 
-	// Managed datastore (HA): provision the etcd cluster and wire its --datastore-endpoint BEFORE
-	// any server launches. A bring-your-own DatastoreEndpoint skips this. Returns one NodeInfo per
-	// etcd member. Extracted to setupDatastore to keep Create readable.
-	datastoreInfos, endpoint, err := p.setupDatastore(ctx, cfg, logw)
+	// Resolve the cluster state dir up front (absolute). It holds state.json, the kubeconfig, the
+	// haproxy.cfg, and — new in v0.5.0 — the generated etcd TLS bundle, so the managed datastore
+	// provisioning below needs it BEFORE any container launches. Absolute is required: `container`
+	// resolves a relative bind source against the container root.
+	clusterDir, err := ensureClusterDir(cfg.StateDir, cfg.Name)
+	if err != nil {
+		return ClusterState{}, err
+	}
+
+	// Managed datastore (HA): provision the etcd cluster (over mutual TLS, v0.5.0) and wire its
+	// --datastore-endpoint + client TLS dir BEFORE any server launches. A bring-your-own
+	// DatastoreEndpoint skips this. Returns one NodeInfo per member, the endpoint, and the absolute
+	// host dir holding the k3s datastore client TLS bundle ("" when not managed-etcd). Extracted to
+	// setupDatastore to keep Create readable.
+	datastoreInfos, endpoint, tlsClientDir, err := p.setupDatastore(ctx, cfg, clusterDir, logw)
 	if err != nil {
 		return ClusterState{}, err
 	}
 
 	cfg.DatastoreEndpoint = endpoint
+	cfg.DatastoreTLSDir = tlsClientDir
 
 	// Create each node's k3s datastore named volume before launch, and refuse to boot
 	// onto stale state from a prior run (see prepareNodeVolumes). Volumes are stamped
@@ -126,18 +138,8 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 	// read it straight off the host filesystem. This avoids container cp / exec entirely —
 	// both ride the guest agent (vminitd over vsock), which faults under k3s's cold-boot
 	// image-extraction I/O and SIGKILLs the cp, cascading to a whole-daemon stop/rm hang
-	// (Apple containerization #678/#712, container #861; verified 2026-06-27). The mount
-	// must exist before the server launches, so resolve+create it now and hand the absolute
-	// path to the server's run args. (Absolute is also required: container resolves a
-	// relative bind source against the container root.)
-	rel := filepath.Join(cfg.StateDir, cfg.Name)
-	clusterDir, err := filepath.Abs(rel)
-	if err != nil {
-		return ClusterState{}, fmt.Errorf("resolving cluster state dir %q: %w", rel, err)
-	}
-	if err := os.MkdirAll(clusterDir, 0o755); err != nil {
-		return ClusterState{}, fmt.Errorf("creating cluster state dir %q: %w", clusterDir, err)
-	}
+	// (Apple containerization #678/#712, container #861; verified 2026-06-27). clusterDir (resolved
+	// above) is the bind source; the server's run args receive its absolute path.
 
 	// AUTO-DEPLOY MANIFESTS (v0.4.0): resolve each requested manifest to an absolute path
 	// (the `container` runtime resolves a relative bind source against the container root —
@@ -348,17 +350,17 @@ func (p *provisioner) launchJoinServers(ctx context.Context, cfg ClusterConfig, 
 // every server reaches the others by FQDN, which is what lets the control plane survive the
 // cold-restart IP shift (docs/ADR-0003 — name-bound etcd membership, unlike the IP-bound embedded
 // etcd ADR-0002 rejected).
-func (p *provisioner) setupDatastore(ctx context.Context, cfg ClusterConfig, logw io.Writer) ([]NodeInfo, string, error) {
+func (p *provisioner) setupDatastore(ctx context.Context, cfg ClusterConfig, clusterDir string, logw io.Writer) ([]NodeInfo, string, string, error) {
 	if !cfg.ManageDatastore || cfg.DatastoreEndpoint != "" {
-		return nil, cfg.DatastoreEndpoint, nil
+		return nil, cfg.DatastoreEndpoint, "", nil
 	}
 
 	if p.dnsDomain == "" {
-		return nil, "", fmt.Errorf("cluster %q: a managed datastore (HA) requires a DNS domain for a stable "+
+		return nil, "", "", fmt.Errorf("cluster %q: a managed datastore (HA) requires a DNS domain for a stable "+
 			"endpoint; set -dns-domain (and run: sudo container system dns create <domain>)", cfg.Name)
 	}
 
-	return p.provisionEtcdCluster(ctx, cfg, logw)
+	return p.provisionEtcdCluster(ctx, cfg, clusterDir, logw)
 }
 
 // provisionEtcdCluster brings up the N-member etcd cluster and returns one NodeInfo per member
@@ -373,18 +375,31 @@ func (p *provisioner) setupDatastore(ctx context.Context, cfg ClusterConfig, log
 // deliberately do NOT add an immediate cross-member quorum assert: the in-VM resolver negative-
 // caches a peer's NXDOMAIN for ~30s right after startup, so a strict cross-node health probe here
 // would be flaky (ADR-0003 gotcha). The caller must have ensured p.dnsDomain != "".
-func (p *provisioner) provisionEtcdCluster(ctx context.Context, cfg ClusterConfig, logw io.Writer) ([]NodeInfo, string, error) {
+func (p *provisioner) provisionEtcdCluster(ctx context.Context, cfg ClusterConfig, clusterDir string, logw io.Writer) ([]NodeInfo, string, string, error) {
 	count := cfg.DatastoreMembers
 	if count == 0 {
 		count = defaultEtcdMembers
 	}
 
 	if err := validateEtcdMemberCount(count); err != nil {
-		return nil, "", fmt.Errorf("cluster %q: %w", cfg.Name, err)
+		return nil, "", "", fmt.Errorf("cluster %q: %w", cfg.Name, err)
 	}
 
-	members := etcdMembers(cfg.Name, count)
+	memBytes := cfg.DatastoreMemoryBytes
+	if memBytes == 0 {
+		memBytes = defaultEtcdMemoryBytes
+	}
+
+	members := etcdMembers(cfg.Name, count, memBytes)
 	initialCluster := etcdInitialCluster(cfg.Name, p.dnsDomain, count)
+
+	// Generate + deliver the etcd TLS bundle (v0.5.0) before any member launches: each member needs
+	// its own server cert at boot, and the k3s servers need the client bundle. Delivery is the host
+	// bind-mount (writeEtcdTLS → buildEtcdRunArgs / buildRunArgs), never container cp (ADR-0001).
+	memberTLSDirs, clientTLSDir, err := p.deliverEtcdTLS(cfg.Name, clusterDir, members)
+	if err != nil {
+		return nil, "", "", err
+	}
 
 	// Create every member's data volume first (with the stale-state guard), so a leftover volume
 	// from a prior run is caught before any container launches — same discipline as
@@ -394,16 +409,16 @@ func (p *provisioner) provisionEtcdCluster(ctx context.Context, cfg ClusterConfi
 
 		present, err := p.volumeExists(ctx, vol)
 		if err != nil {
-			return nil, "", fmt.Errorf("checking etcd volume %q: %w", vol, err)
+			return nil, "", "", fmt.Errorf("checking etcd volume %q: %w", vol, err)
 		}
 
 		if present {
-			return nil, "", fmt.Errorf("etcd volume %q already exists (stale state from a prior run); "+
+			return nil, "", "", fmt.Errorf("etcd volume %q already exists (stale state from a prior run); "+
 				"run -destroy for this cluster first — refusing to reuse it", vol)
 		}
 
 		if err := p.volumeCreate(ctx, vol, volumeLabels(cfg.Name)...); err != nil {
-			return nil, "", fmt.Errorf("creating etcd volume %q: %w", vol, err)
+			return nil, "", "", fmt.Errorf("creating etcd volume %q: %w", vol, err)
 		}
 	}
 
@@ -415,13 +430,13 @@ func (p *provisioner) provisionEtcdCluster(ctx context.Context, cfg ClusterConfi
 
 		fmt.Fprintln(logw, "provisioning etcd member", id)
 
-		if _, err := p.run(ctx, buildEtcdRunArgs(cfg, m, p.dnsDomain, initialCluster)...); err != nil {
-			return nil, "", fmt.Errorf("launching etcd member %q: %w", id, err)
+		if _, err := p.run(ctx, buildEtcdRunArgs(cfg, m, p.dnsDomain, initialCluster, memberTLSDirs[m.Name])...); err != nil {
+			return nil, "", "", fmt.Errorf("launching etcd member %q: %w", id, err)
 		}
 
 		addr, err := p.waitForIPv4(ctx, id)
 		if err != nil {
-			return nil, "", err
+			return nil, "", "", err
 		}
 
 		infos = append(infos, NodeInfo{ID: id, Name: m.Name, Role: RoleDatastore, IPs: []netip.Addr{addr}})
@@ -429,11 +444,35 @@ func (p *provisioner) provisionEtcdCluster(ctx context.Context, cfg ClusterConfi
 
 	for _, info := range infos {
 		if err := p.waitForEtcdMember(ctx, info.IPs[0]); err != nil {
-			return nil, "", fmt.Errorf("etcd member %q readiness: %w", info.ID, err)
+			return nil, "", "", fmt.Errorf("etcd member %q readiness: %w", info.ID, err)
 		}
 	}
 
-	return infos, etcdDatastoreEndpoint(cfg.Name, p.dnsDomain, count), nil
+	return infos, etcdDatastoreEndpoint(cfg.Name, p.dnsDomain, count), clientTLSDir, nil
+}
+
+// deliverEtcdTLS generates the managed etcd TLS bundle (one CA, a server cert per member, one k3s
+// client cert) and writes it under the cluster state dir, returning the per-member bind-mount dirs
+// (keyed by member name) and the client bind-mount dir. Host-side crypto/x509 + a bind-mount, no
+// external CA tooling and no container cp (ADR-0001). A method on the provisioner because the SANs
+// are FQDN-bound to p.dnsDomain; extracted from provisionEtcdCluster to keep it readable.
+func (p *provisioner) deliverEtcdTLS(clusterName, clusterDir string, members []NodeConfig) (map[string]string, string, error) {
+	memberNames := make([]string, len(members))
+	for i, m := range members {
+		memberNames[i] = m.Name
+	}
+
+	bundle, err := generateEtcdTLS(clusterName, p.dnsDomain, memberNames)
+	if err != nil {
+		return nil, "", fmt.Errorf("cluster %q: generating etcd TLS: %w", clusterName, err)
+	}
+
+	memberDirs, clientDir, err := writeEtcdTLS(clusterDir, bundle)
+	if err != nil {
+		return nil, "", fmt.Errorf("cluster %q: delivering etcd TLS: %w", clusterName, err)
+	}
+
+	return memberDirs, clientDir, nil
 }
 
 // setupAPILB provisions the API load balancer when one is requested, returning its NodeInfo.
@@ -494,6 +533,25 @@ func (p *provisioner) provisionAPILB(ctx context.Context, cfg ClusterConfig, ser
 	}
 
 	return NodeInfo{ID: id, Name: name, Role: RoleLB, IPs: []netip.Addr{addr}}, nil
+}
+
+// ensureClusterDir resolves <stateDir>/<clusterName> to an ABSOLUTE path and creates it. Absolute
+// is required everywhere the dir is a bind source: `container` resolves a relative bind source
+// against the container root (the kubeconfig, haproxy.cfg, and etcd TLS mounts all rely on this).
+// Shared by Create, AddServer, and MergeKubeconfig so they agree on the one state-dir location.
+func ensureClusterDir(stateDir, clusterName string) (string, error) {
+	rel := filepath.Join(stateDir, clusterName)
+
+	dir, err := filepath.Abs(rel)
+	if err != nil {
+		return "", fmt.Errorf("resolving cluster state dir %q: %w", rel, err)
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("creating cluster state dir %q: %w", dir, err)
+	}
+
+	return dir, nil
 }
 
 // writeAPILBConfig writes the generated haproxy.cfg into <clusterDir>/<apiLBConfigSubdir> and

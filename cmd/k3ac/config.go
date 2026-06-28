@@ -47,9 +47,13 @@ type fileConfig struct {
 	// DatastoreMembers is the managed etcd cluster size (odd, >=3) for the auto-provisioned HA
 	// datastore. 0 = absent → the built-in default (3) stays in effect (see applyConfig). Only
 	// meaningful when Servers>1 and DatastoreEndpoint is empty.
-	DatastoreMembers int   `json:"datastoreMembers"`
-	ServerMemoryMB   int64 `json:"serverMemoryMB"`
-	AgentMemoryMB    int64 `json:"agentMemoryMB"`
+	DatastoreMembers int `json:"datastoreMembers"`
+	// DatastoreImage / DatastoreMemoryMB override the managed etcd member image / memory (v0.5.0).
+	// "" / 0 = "not specified" → the built-in defaults stay in effect. Managed-etcd path only.
+	DatastoreImage    string `json:"datastoreImage"`
+	DatastoreMemoryMB int64  `json:"datastoreMemoryMB"`
+	ServerMemoryMB    int64  `json:"serverMemoryMB"`
+	AgentMemoryMB     int64  `json:"agentMemoryMB"`
 	// Servers: control-plane node count. Unlike Agents, 0 is NOT a valid shape (a cluster
 	// needs at least one server), so absent-from-file (0) leaves the built-in default (1)
 	// in place — see applyConfig. Set "servers": N (with "datastoreEndpoint") for HA.
@@ -70,6 +74,9 @@ type fileConfig struct {
 	NodeLabels []string `json:"nodeLabels"`
 	// Manifests are host-side manifest file paths auto-deployed via the bootstrap server (v0.4.0).
 	Manifests []string `json:"manifests"`
+	// EnvVars are KEY=VALUE environment variables injected into every k3s node (v0.5.0; -env).
+	// Empty/absent = none.
+	EnvVars []string `json:"envVars"`
 }
 
 // flagRefs bundles pointers to every flag variable applyConfig may overwrite. It replaces the
@@ -92,12 +99,17 @@ type flagRefs struct {
 	// datastoreMembers is the managed etcd cluster size (v0.3.0); folded into the struct during
 	// the v0.4.0 rebase so the applyConfig refactor and the etcd HA path coexist.
 	datastoreMembers *int
-	serverCPUs       *int
-	agentCPUs        *int
-	serverArgs       *stringList
-	agentArgs        *stringList
-	nodeLabels       *stringList
-	manifests        *stringList
+	// datastoreImage / datastoreMemMB expose the managed etcd member image/memory (v0.5.0).
+	datastoreImage *string
+	datastoreMemMB *int64
+	serverCPUs     *int
+	agentCPUs      *int
+	serverArgs     *stringList
+	agentArgs      *stringList
+	nodeLabels     *stringList
+	manifests      *stringList
+	// envVars is the -env KEY=VALUE list injected into every node (v0.5.0).
+	envVars *stringList
 }
 
 // loadFileConfig reads a JSON cluster specification from path and decodes it into
@@ -199,6 +211,25 @@ func applyConfig(fc fileConfig, explicit map[string]bool, r flagRefs) {
 	}
 
 	applyV040Config(fc, explicit, r)
+	applyV050Config(fc, explicit, r)
+}
+
+// applyV050Config applies the v0.5.0 config-backed flags: the managed datastore image/memory and
+// the -env list. Split out so applyConfig stays under the cognitive-complexity gate; precedence is
+// identical to the rest (file value used only when the matching flag was not set explicitly).
+func applyV050Config(fc fileConfig, explicit map[string]bool, r flagRefs) {
+	if !explicit["datastore-image"] && fc.DatastoreImage != "" {
+		*r.datastoreImage = fc.DatastoreImage
+	}
+
+	// 0 = "not specified" → keep the built-in default (512 MB), mirroring the memory fields.
+	if !explicit["datastore-memory"] && fc.DatastoreMemoryMB != 0 {
+		*r.datastoreMemMB = fc.DatastoreMemoryMB
+	}
+
+	if !explicit["env"] && len(fc.EnvVars) > 0 {
+		*r.envVars = fc.EnvVars
+	}
 }
 
 // applyV040Config applies the v0.4.0 config-backed flags (per-node CPUs and the four repeated
