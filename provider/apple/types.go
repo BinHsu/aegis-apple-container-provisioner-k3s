@@ -108,6 +108,20 @@ type ClusterConfig struct {
 	// validateEtcdMemberCount enforces that. 0 means "use defaultEtcdMembers" (3). Only meaningful
 	// with ManageDatastore (a bring-your-own DatastoreEndpoint ignores it).
 	DatastoreMembers int
+	// DatastoreImage overrides the managed etcd member image (-datastore-image, v0.5.0). Empty =
+	// defaultEtcdImage. Only meaningful for the managed etcd path; a bring-your-own endpoint
+	// ignores it (the operator owns their datastore's image).
+	DatastoreImage string
+	// DatastoreMemoryBytes overrides each managed etcd member's memory in bytes (-datastore-memory,
+	// v0.5.0). 0 = defaultEtcdMemoryBytes (512 MiB). Same managed-only scope as DatastoreImage.
+	DatastoreMemoryBytes int64
+	// DatastoreTLSDir is NOT a request field — Create populates it (like DatastoreEndpoint) with the
+	// absolute host dir holding the k3s datastore CLIENT TLS bundle (ca.crt/client.crt/client.key)
+	// it generated for the managed etcd cluster (v0.5.0). When non-empty, buildRunArgs bind-mounts it
+	// read-only into every server and passes --datastore-cafile/certfile/keyfile so the servers reach
+	// etcd over mutual TLS. Empty = plain datastore connection (bring-your-own endpoint, or no managed
+	// etcd). See etcd_tls.go.
+	DatastoreTLSDir string
 	// ProvisionAPILB asks Create to provision an API-server load balancer micro-VM (haproxy
 	// mode tcp) at the shared FQDN <cluster>-api.<domain>, and to point the kubeconfig + agents
 	// at that one endpoint instead of the bootstrap server (docs/ADR/0002, v0.3.0). It is
@@ -117,6 +131,11 @@ type ClusterConfig struct {
 	// domain and skips gracefully (no LB, keep pointing at the bootstrap server) when absent. The
 	// LB node is NOT listed in Nodes — Create provisions it separately.
 	ProvisionAPILB bool
+	// EnvVars are operator-supplied environment variables (each "KEY=VALUE") injected into EVERY
+	// k3s node's `container run` as a --env flag (v0.5.0; -env, repeatable). They sit alongside the
+	// built-in K3S_TOKEN / K3S_URL env and are create-time only (AddAgents/AddServer do not thread
+	// them). Empty = none. Mirrors the -k3s-server-arg stringList pattern.
+	EnvVars []string
 	// Manifests are host-side Kubernetes manifest file paths bind-mounted into the BOOTSTRAP
 	// server's k3s auto-deploy dir (/var/lib/rancher/k3s/server/manifests) so k3s applies them
 	// at startup (v0.4.0). Each file is mounted INDIVIDUALLY (not the whole directory) so k3s's

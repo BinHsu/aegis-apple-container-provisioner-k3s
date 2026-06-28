@@ -233,27 +233,28 @@ func TestValidateEtcdMemberCount(t *testing.T) {
 // single source of truth shared by buildEtcdRunArgs (--initial-cluster) and the k3s servers
 // (--datastore-endpoint). BVA on member count: B=3 (the default/minimum) and B+2=5.
 func TestEtcdInitialClusterAndEndpoint(t *testing.T) {
-	// 3 members: each member-name keyed to its FQDN peer URL, comma-joined, in order.
-	wantInitial3 := "aegis-etcd-1=http://aegis-etcd-1.aegis:2380," +
-		"aegis-etcd-2=http://aegis-etcd-2.aegis:2380," +
-		"aegis-etcd-3=http://aegis-etcd-3.aegis:2380"
+	// 3 members: each member-name keyed to its FQDN peer URL, comma-joined, in order. https:// since
+	// v0.5.0 (the managed quorum runs over mutual TLS).
+	wantInitial3 := "aegis-etcd-1=https://aegis-etcd-1.aegis:2380," +
+		"aegis-etcd-2=https://aegis-etcd-2.aegis:2380," +
+		"aegis-etcd-3=https://aegis-etcd-3.aegis:2380"
 	if got := etcdInitialCluster("aegis", "aegis", 3); got != wantInitial3 {
 		t.Errorf("etcdInitialCluster(3):\n got %q\nwant %q", got, wantInitial3)
 	}
 
-	wantEndpoint3 := "http://aegis-etcd-1.aegis:2379," +
-		"http://aegis-etcd-2.aegis:2379," +
-		"http://aegis-etcd-3.aegis:2379"
+	wantEndpoint3 := "https://aegis-etcd-1.aegis:2379," +
+		"https://aegis-etcd-2.aegis:2379," +
+		"https://aegis-etcd-3.aegis:2379"
 	if got := etcdDatastoreEndpoint("aegis", "aegis", 3); got != wantEndpoint3 {
 		t.Errorf("etcdDatastoreEndpoint(3):\n got %q\nwant %q", got, wantEndpoint3)
 	}
 
 	// 5 members: exactly five comma-separated client URLs (one per member).
-	if got := strings.Count(etcdDatastoreEndpoint("aegis", "aegis", 5), "http://"); got != 5 {
+	if got := strings.Count(etcdDatastoreEndpoint("aegis", "aegis", 5), "https://"); got != 5 {
 		t.Errorf("etcdDatastoreEndpoint(5): got %d client URLs, want 5", got)
 	}
 
-	if got := strings.Count(etcdInitialCluster("aegis", "aegis", 5), "=http://"); got != 5 {
+	if got := strings.Count(etcdInitialCluster("aegis", "aegis", 5), "=https://"); got != 5 {
 		t.Errorf("etcdInitialCluster(5): got %d member entries, want 5", got)
 	}
 }
@@ -270,7 +271,7 @@ func TestEtcdHelpers(t *testing.T) {
 		t.Errorf("etcdVolumeName: got %q, want aegis-etcd-2-data", got)
 	}
 
-	members := etcdMembers("aegis", 3)
+	members := etcdMembers("aegis", 3, defaultEtcdMemoryBytes)
 	if len(members) != 3 {
 		t.Fatalf("etcdMembers(3): got %d members, want 3", len(members))
 	}
@@ -297,7 +298,8 @@ func TestBuildEtcdRunArgs(t *testing.T) {
 	member := NodeConfig{Name: "aegis-etcd-1", Role: RoleDatastore, Memory: defaultEtcdMemoryBytes}
 	initial := etcdInitialCluster("aegis", "aegis", 3)
 
-	args := buildEtcdRunArgs(cfg, member, "aegis", initial)
+	tlsDir := "/abs/state/aegis/etcd-tls/aegis-etcd-1"
+	args := buildEtcdRunArgs(cfg, member, "aegis", initial, tlsDir)
 	joined := strings.Join(args, " ")
 
 	checks := []struct {
@@ -309,10 +311,20 @@ func TestBuildEtcdRunArgs(t *testing.T) {
 		{hasPair(args, "--volume", etcdVolumeName("aegis-etcd-1")+":"+etcdDataMount), "data on the per-member named volume at the mount root"},
 		{hasPair(args, "--data-dir", etcdDataDir), "--data-dir is a SUBDIR of the mount (ext4 lost+found guard)"},
 		{strings.HasPrefix(etcdDataDir, etcdDataMount+"/"), "data dir is strictly under the mount"},
-		{hasPair(args, "--initial-advertise-peer-urls", "http://aegis-etcd-1.aegis:2380"), "advertise peer URL is the FQDN (name-bound membership)"},
-		{hasPair(args, "--advertise-client-urls", "http://aegis-etcd-1.aegis:2379"), "advertise client URL is the FQDN"},
-		{hasPair(args, "--listen-peer-urls", "http://0.0.0.0:2380"), "listen peer URL binds all interfaces"},
-		{hasPair(args, "--listen-client-urls", "http://0.0.0.0:2379"), "listen client URL binds all interfaces"},
+		// v0.5.0: mutual TLS — https URLs, the bind-mounted TLS bundle, and the peer + client flags.
+		{hasPair(args, "--volume", tlsDir+":"+etcdTLSMount+":ro"), "TLS bundle bind-mounted read-only (host bind-mount, not container cp)"},
+		{hasPair(args, "--peer-cert-file", etcdTLSMount+"/"+etcdServerCertFile), "--peer-cert-file points at the bind-mounted server cert"},
+		{hasPair(args, "--peer-key-file", etcdTLSMount+"/"+etcdServerKeyFile), "--peer-key-file points at the bind-mounted server key"},
+		{hasPair(args, "--peer-trusted-ca-file", etcdTLSMount+"/"+etcdCACertFile), "--peer-trusted-ca-file points at the CA"},
+		{slices.Contains(args, "--peer-client-cert-auth=true"), "--peer-client-cert-auth=true (mutual peer TLS)"},
+		{hasPair(args, "--cert-file", etcdTLSMount+"/"+etcdServerCertFile), "--cert-file points at the bind-mounted server cert"},
+		{hasPair(args, "--key-file", etcdTLSMount+"/"+etcdServerKeyFile), "--key-file points at the bind-mounted server key"},
+		{hasPair(args, "--trusted-ca-file", etcdTLSMount+"/"+etcdCACertFile), "--trusted-ca-file points at the CA"},
+		{slices.Contains(args, "--client-cert-auth=true"), "--client-cert-auth=true (mutual client TLS)"},
+		{hasPair(args, "--initial-advertise-peer-urls", "https://aegis-etcd-1.aegis:2380"), "advertise peer URL is the FQDN over https (name-bound membership)"},
+		{hasPair(args, "--advertise-client-urls", "https://aegis-etcd-1.aegis:2379"), "advertise client URL is the FQDN over https"},
+		{hasPair(args, "--listen-peer-urls", "https://0.0.0.0:2380"), "listen peer URL binds all interfaces over https"},
+		{hasPair(args, "--listen-client-urls", "https://0.0.0.0:2379"), "listen client URL binds all interfaces over https"},
 		{hasPair(args, "--initial-cluster", initial), "--initial-cluster carries the full FQDN member list"},
 		{hasPair(args, "--initial-cluster-state", "new"), "--initial-cluster-state new"},
 		{hasPair(args, "--initial-cluster-token", "aegis-etcd"), "--initial-cluster-token isolates this cluster's quorum"},
@@ -346,12 +358,12 @@ func TestBuildEtcdRunArgs_Network(t *testing.T) {
 	cfg.Network = "k3snet"
 	member := NodeConfig{Name: "aegis-etcd-1", Role: RoleDatastore, Memory: defaultEtcdMemoryBytes}
 
-	if !hasPair(buildEtcdRunArgs(cfg, member, "aegis", "x=y"), "--network", "k3snet") {
+	if !hasPair(buildEtcdRunArgs(cfg, member, "aegis", "x=y", "/abs/tls"), "--network", "k3snet") {
 		t.Error("custom network must be passed to the etcd container")
 	}
 
 	cfg.Network = ""
-	if slices.Contains(buildEtcdRunArgs(cfg, member, "aegis", "x=y"), "--network") {
+	if slices.Contains(buildEtcdRunArgs(cfg, member, "aegis", "x=y", "/abs/tls"), "--network") {
 		t.Error("empty network must NOT emit --network")
 	}
 }
@@ -362,7 +374,7 @@ func TestBuildEtcdRunArgs_Network(t *testing.T) {
 // role-keyed branch in destroyRecordedNodes: RoleDatastore -> etcdVolumeName(node.Name).
 func TestDestroyEtcdVolumeEnumeration(t *testing.T) {
 	// A 3-member etcd cluster as Create would record it (RoleDatastore, member names).
-	members := etcdMembers("aegis", 3)
+	members := etcdMembers("aegis", 3, defaultEtcdMemoryBytes)
 
 	for _, m := range members {
 		node := NodeInfo{Name: m.Name, Role: RoleDatastore}
