@@ -106,6 +106,10 @@ participant reaches the datastore by name.
   is a separate, larger piece of work — out of scope for the first HA cut. State this
   plainly to operators: HA servers, non-HA datastore, until the datastore is itself
   replicated.
+
+  **Update (v0.3.0):** Closed by ADR-0003. The single managed-Postgres VM was replaced by an
+  auto-provisioned 3-node external etcd cluster addressed by FQDN. Both the control plane and
+  the datastore are now HA.
 - **Resource cost.** Each server is a full control plane (~620 MB steady; 2 GB VM in the
   spike) plus the datastore VM. Two servers + DB ≈ 5 GB.
 - **PGDATA on a named volume.** An Apple `container` named volume is block-backed ext4 and
@@ -117,6 +121,12 @@ participant reaches the datastore by name.
 - **TLS to the datastore.** The spike used `sslmode=disable` for speed. k3s supports
   `--datastore-cafile/--datastore-certfile/--datastore-keyfile` for a TLS-secured
   datastore connection; harden this before any non-spike use.
+
+  **Update (v0.5.0):** Closed. The managed etcd cluster now runs over mutual TLS. k3ac
+  generates (host-side, stdlib `crypto/x509`) one CA, per-member server certs (FQDN SANs),
+  and a k3s client cert. etcd enforces `--peer-client-cert-auth` and `--client-cert-auth`;
+  k3s servers connect with `--datastore-cafile/--datastore-certfile/--datastore-keyfile`.
+  See `provider/apple/etcd_tls.go`.
 
 ---
 
@@ -144,6 +154,10 @@ constraint.
 A k3d-style API LB in front of the servers. **Deferred, not rejected.** It only becomes
 meaningful with multiple servers (agents can join any server IP directly), so it pairs
 with HA rather than preceding it. Add it after multi-server is in place.
+
+**Update (v0.3.0):** Shipped. An haproxy L4 container (`<cluster>-api.<domain>`, `mode tcp`)
+fronts the server pool. The kubeconfig endpoint is the LB FQDN; `-add-server` and
+`-remove-node` rewrite the haproxy config live.
 
 ---
 
