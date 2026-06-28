@@ -1,0 +1,242 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <defs>
+    <!-- Arrow markers -->
+    <marker id="arr-r" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#c03030"/>
+    </marker>
+    <marker id="arr-l" markerWidth="8" markerHeight="6" refX="1" refY="3" orient="auto">
+      <polygon points="8 0, 0 3, 8 6" fill="#c03030"/>
+    </marker>
+    <marker id="arr-d" markerWidth="7" markerHeight="9" refX="3.5" refY="8" orient="auto">
+      <polygon points="0 0, 7 0, 3.5 9" fill="#d29922"/>
+    </marker>
+  </defs>
+
+  <!-- ── Background ─────────────────────────────────────────── -->
+  <rect width="1280" height="640" fill="#0d1117"/>
+  <rect width="1280" height="4" fill="#1f6feb" opacity="0.8"/>
+
+  <!-- ── Title block ─────────────────────────────────────────── -->
+  <text x="640" y="52" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', Consolas, monospace"
+        font-size="34" font-weight="700" fill="#e6edf3"
+        letter-spacing="-0.5">k3s on Apple's container runtime</text>
+
+  <text x="640" y="82" text-anchor="middle"
+        font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="17" fill="#7d8590" letter-spacing="0.3">
+    one micro-VM per node  ·  external etcd HA + haproxy LB  ·  macOS  ·  Apple Silicon
+  </text>
+
+  <line x1="80" y1="97" x2="1200" y2="97" stroke="#21262d" stroke-width="1"/>
+
+  <!-- ── macOS host outer box ────────────────────────────────── -->
+  <rect x="22" y="108" width="1236" height="490" rx="8"
+        fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="36" y="126" font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="12" fill="#6e7681">macOS 26+  ·  Apple Silicon host</text>
+
+  <!-- ── apple/container runtime box ───────────────────────── -->
+  <rect x="50" y="133" width="1180" height="453" rx="6"
+        fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="640" y="153" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="13" font-weight="600" fill="#388bfd">
+    apple/container runtime  (vmnet · per-VM DHCP)
+  </text>
+  <text x="640" y="174" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="11" fill="#6e7681">
+    Stable endpoint: hav-api.aegis:6443  →  haproxy L4 LB  (FQDN survives DHCP IP churn)
+  </text>
+
+  <!-- ── External etcd quorum (the differentiator) ───────────── -->
+  <rect x="80" y="184" width="1120" height="100" rx="5"
+        fill="#190a0a" stroke="#c03030" stroke-width="1"
+        stroke-dasharray="5,3"/>
+  <text x="640" y="201" text-anchor="middle"
+        font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="12" fill="#ef5350">
+    external etcd quorum  ·  3 dedicated VMs  ·  mutual TLS  (NOT embedded in the control plane)
+  </text>
+
+  <!-- etcd-1 -->
+  <rect x="108" y="208" width="300" height="68" rx="5"
+        fill="#1a0808" stroke="#c03030" stroke-width="1.5"/>
+  <text x="258" y="230" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="14" font-weight="700" fill="#e6edf3">hav-etcd-1</text>
+  <text x="258" y="249" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="12" fill="#7d8590">192.168.x.a</text>
+  <text x="258" y="267" text-anchor="middle"
+        font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="10" fill="#c03030">micro-VM · member 1 / 3</text>
+
+  <!-- etcd-2 -->
+  <rect x="490" y="208" width="300" height="68" rx="5"
+        fill="#1a0808" stroke="#c03030" stroke-width="1.5"/>
+  <text x="640" y="230" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="14" font-weight="700" fill="#e6edf3">hav-etcd-2</text>
+  <text x="640" y="249" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="12" fill="#7d8590">192.168.x.b</text>
+  <text x="640" y="267" text-anchor="middle"
+        font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="10" fill="#c03030">micro-VM · member 2 / 3</text>
+
+  <!-- etcd-3 -->
+  <rect x="872" y="208" width="300" height="68" rx="5"
+        fill="#1a0808" stroke="#c03030" stroke-width="1.5"/>
+  <text x="1022" y="230" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="14" font-weight="700" fill="#e6edf3">hav-etcd-3</text>
+  <text x="1022" y="249" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="12" fill="#7d8590">192.168.x.c</text>
+  <text x="1022" y="267" text-anchor="middle"
+        font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="10" fill="#c03030">micro-VM · member 3 / 3</text>
+
+  <!-- etcd raft arrows (bidirectional) -->
+  <line x1="408" y1="242" x2="490" y2="242"
+        stroke="#c03030" stroke-width="1.5"
+        marker-end="url(#arr-r)" marker-start="url(#arr-l)"/>
+  <line x1="790" y1="242" x2="872" y2="242"
+        stroke="#c03030" stroke-width="1.5"
+        marker-end="url(#arr-r)" marker-start="url(#arr-l)"/>
+
+  <!-- flow: servers ↔ datastore -->
+  <line x1="640" y1="284" x2="640" y2="298"
+        stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-d)"/>
+
+  <!-- ── haproxy L4 API load balancer ────────────────────────── -->
+  <rect x="80" y="300" width="1120" height="46" rx="5"
+        fill="#2a2008" stroke="#d29922" stroke-width="1.5"/>
+  <text x="640" y="320" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="13" font-weight="700" fill="#e3b341">
+    haproxy L4 API LB  (mode tcp)  ·  hav-api.aegis:6443
+  </text>
+  <text x="640" y="337" text-anchor="middle"
+        font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="11" fill="#b08800">
+    load-balances kube-apiserver across the server pool  ·  add/remove-server rewrites it in place
+  </text>
+
+  <!-- flow: LB → servers -->
+  <line x1="640" y1="346" x2="640" y2="360"
+        stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-d)"/>
+
+  <!-- ── k3s Server Nodes ────────────────────────────────────── -->
+  <rect x="80" y="362" width="1120" height="84" rx="5"
+        fill="#0f1b2d" stroke="#1f6feb" stroke-width="1"
+        stroke-dasharray="5,3"/>
+  <text x="640" y="379" text-anchor="middle"
+        font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="12" fill="#388bfd">k3s Server Nodes  ·  stateless against the external datastore</text>
+
+  <!-- srv-1 -->
+  <rect x="108" y="386" width="300" height="52" rx="5"
+        fill="#0d1b2e" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="258" y="408" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="13" font-weight="700" fill="#e6edf3">k3s-srv-1</text>
+  <text x="258" y="426" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="11" fill="#7d8590">192.168.x.e  ·  micro-VM</text>
+
+  <!-- srv-2 -->
+  <rect x="490" y="386" width="300" height="52" rx="5"
+        fill="#0d1b2e" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="640" y="408" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="13" font-weight="700" fill="#e6edf3">k3s-srv-2</text>
+  <text x="640" y="426" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="11" fill="#7d8590">192.168.x.f  ·  micro-VM</text>
+
+  <text x="831" y="418" text-anchor="middle"
+        font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="20" fill="#6e7681">···</text>
+
+  <!-- srv-N -->
+  <rect x="872" y="386" width="300" height="52" rx="5"
+        fill="#0d1b2e" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="1022" y="408" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="13" font-weight="700" fill="#e6edf3">k3s-srv-N</text>
+  <text x="1022" y="426" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="11" fill="#7d8590">micro-VM</text>
+
+  <!-- ── k3s Agent Nodes ─────────────────────────────────────── -->
+  <rect x="80" y="454" width="1120" height="78" rx="5"
+        fill="#0a1628" stroke="#2ea043" stroke-width="1"
+        stroke-dasharray="5,3"/>
+  <text x="640" y="471" text-anchor="middle"
+        font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="12" fill="#2ea043">k3s Agent Nodes  (workers)  ·  join via the haproxy VIP</text>
+
+  <!-- worker-1 -->
+  <rect x="108" y="478" width="300" height="48" rx="5"
+        fill="#0a1f12" stroke="#2ea043" stroke-width="1.5"/>
+  <text x="258" y="499" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="13" font-weight="700" fill="#e6edf3">worker-1</text>
+  <text x="258" y="516" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="11" fill="#7d8590">192.168.x.g  ·  micro-VM</text>
+
+  <!-- worker-2 -->
+  <rect x="490" y="478" width="300" height="48" rx="5"
+        fill="#0a1f12" stroke="#2ea043" stroke-width="1.5"/>
+  <text x="640" y="499" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="13" font-weight="700" fill="#e6edf3">worker-2</text>
+  <text x="640" y="516" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="11" fill="#7d8590">192.168.x.h  ·  micro-VM</text>
+
+  <text x="831" y="508" text-anchor="middle"
+        font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="20" fill="#6e7681">···</text>
+
+  <!-- worker-N -->
+  <rect x="872" y="478" width="300" height="48" rx="5"
+        fill="#0a1f12" stroke="#2ea043" stroke-width="1.5"/>
+  <text x="1022" y="499" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="13" font-weight="700" fill="#e6edf3">worker-N</text>
+  <text x="1022" y="516" text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="11" fill="#7d8590">micro-VM</text>
+
+  <!-- ── Bottom annotation bar ──────────────────────────────── -->
+  <line x1="80" y1="543" x2="1200" y2="543" stroke="#21262d" stroke-width="1"/>
+
+  <rect x="80" y="550" width="14" height="14" rx="2" fill="#c03030" opacity="0.85"/>
+  <text x="101" y="562"
+        font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="12" fill="#8b949e">
+    <tspan font-weight="600" fill="#e6edf3">External datastore</tspan>
+    <tspan>  FQDN-addressed etcd quorum has no IP-bound membership → survives DHCP IP churn (embedded etcd cannot reform quorum)</tspan>
+  </text>
+
+  <rect x="80" y="571" width="14" height="14" rx="2" fill="#d29922" opacity="0.85"/>
+  <text x="101" y="583"
+        font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="12" fill="#8b949e">
+    <tspan font-weight="600" fill="#e6edf3">haproxy L4 VIP</tspan>
+    <tspan>  one stable API endpoint in front of N servers · vs the Talos sibling's embedded etcd + built-in LB</tspan>
+  </text>
+
+  <text x="1200" y="583" text-anchor="end"
+        font-family="ui-monospace, 'SF Mono', monospace"
+        font-size="10" fill="#30363d">
+    aegis-apple-container-provisioner-k3s
+  </text>
+
+  <rect x="0" y="636" width="1280" height="4" fill="#1f6feb" opacity="0.5"/>
+</svg>
