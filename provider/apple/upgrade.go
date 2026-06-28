@@ -82,6 +82,16 @@ func kubectlDrainArgs(kubeconfig, node string) []string {
 	return []string{"--kubeconfig", kubeconfig, "drain", node, "--ignore-daemonsets", "--delete-emptydir-data"}
 }
 
+// kubectlDeleteNodeArgs removes a node's stale Kubernetes Node object before its container is
+// recreated. The recreate boots a NEW container on a new DHCP IP, but the existing Node still
+// carries the OLD InternalIP (and flannel public-ip annotation); k3s's network-policy-controller
+// reads that stale IP at startup and fatal-exits ("failed to find interface with specified node
+// ip"). Deleting the Node lets the recreated kubelet register fresh with the new IP.
+// --ignore-not-found keeps it idempotent (a node may already be gone on a retry).
+func kubectlDeleteNodeArgs(kubeconfig, node string) []string {
+	return []string{"--kubeconfig", kubeconfig, "delete", "node", node, "--ignore-not-found"}
+}
+
 func kubectlWaitReadyArgs(kubeconfig, node string, timeout time.Duration) []string {
 	return []string{"--kubeconfig", kubeconfig, "wait", "--for=condition=Ready",
 		"node/" + node, fmt.Sprintf("--timeout=%ds", int(timeout.Seconds()))}
@@ -217,6 +227,9 @@ func (p *provisioner) rollOneNode(ctx context.Context, cfg ClusterConfig, node N
 	// API may briefly be the very node being rolled, so a drain failure must not abort the upgrade.
 	p.runKubectl(ctx, kubectlCordonArgs(kubeconfig, node.Name), logw)
 	p.runKubectl(ctx, kubectlDrainArgs(kubeconfig, node.Name), logw)
+	// Remove the stale Node object BEFORE recreate so the node rejoins fresh on its new DHCP IP
+	// (see kubectlDeleteNodeArgs — without this the recreated k3s fatal-exits on the old node IP).
+	p.runKubectl(ctx, kubectlDeleteNodeArgs(kubeconfig, node.Name), logw)
 
 	url := ""
 	if node.Role == RoleAgent {
