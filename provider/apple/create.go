@@ -236,6 +236,7 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		StateDir:          cfg.StateDir,
 		Image:             cfg.Image, // resolved (empty->defaultK3sImage above); AddAgents reuses it
 		DatastoreEndpoint: cfg.DatastoreEndpoint,
+		DatastoreImage:    cfg.DatastoreImage, // raw (may be ""); -restore/-rotate-certs recreate etcd on it
 		ServerURL:         serverURL,
 		Nodes:             nodes,
 	}
@@ -308,6 +309,12 @@ func (p *provisioner) launchNode(ctx context.Context, cfg ClusterConfig, node No
 		Name: node.Name,
 		Role: node.Role,
 		IPs:  []netip.Addr{addr},
+		// Record the launch spec so a v0.6.0 recreate (-upgrade/-rollback/-rotate-token) reproduces
+		// this node's size + flags rather than resetting them to defaults (see NodeInfo doc).
+		Memory:    node.Memory,
+		NanoCPUs:  node.NanoCPUs,
+		Labels:    node.Labels,
+		ExtraArgs: node.ExtraArgs,
 	}, nil
 }
 
@@ -439,7 +446,9 @@ func (p *provisioner) provisionEtcdCluster(ctx context.Context, cfg ClusterConfi
 			return nil, "", "", err
 		}
 
-		infos = append(infos, NodeInfo{ID: id, Name: m.Name, Role: RoleDatastore, IPs: []netip.Addr{addr}})
+		// Record the member's memory so -restore relaunches it at the same size (etcd members are
+		// recreated, not just restarted, during a restore — see snapshot.go).
+		infos = append(infos, NodeInfo{ID: id, Name: m.Name, Role: RoleDatastore, IPs: []netip.Addr{addr}, Memory: m.Memory})
 	}
 
 	for _, info := range infos {
