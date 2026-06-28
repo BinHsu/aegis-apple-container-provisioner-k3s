@@ -92,9 +92,16 @@ func kubectlDeleteNodeArgs(kubeconfig, node string) []string {
 	return []string{"--kubeconfig", kubeconfig, "delete", "node", node, "--ignore-not-found"}
 }
 
-func kubectlWaitReadyArgs(kubeconfig, node string, timeout time.Duration) []string {
-	return []string{"--kubeconfig", kubeconfig, "wait", "--for=condition=Ready",
-		"node/" + node, fmt.Sprintf("--timeout=%ds", int(timeout.Seconds()))}
+// kubectlNodeReadyArgs reads a node's Ready condition status ("True"/"False"/"" or a NotFound error).
+// The rolling replace polls this rather than a one-shot `kubectl wait`: the recreate DELETES the Node
+// object first (so the node rejoins on its new IP), and `kubectl wait` errors immediately on the
+// not-yet-re-registered node — the poll tolerates that NotFound window until the fresh kubelet
+// registers and goes Ready.
+func kubectlNodeReadyArgs(kubeconfig, node string) []string {
+	return []string{
+		"--kubeconfig", kubeconfig, "get", "node", node,
+		"-o", `jsonpath={.status.conditions[?(@.type=="Ready")].status}`,
+	}
 }
 
 // Upgrade rolls the cluster onto newImage one k3s node at a time (servers first, then agents),
@@ -252,9 +259,11 @@ func (p *provisioner) rollOneNode(ctx context.Context, cfg ClusterConfig, node N
 	return nil
 }
 
-// waitNodeReady blocks until a recreated node is serving again: a server via waitForAPIServer (its
-// apiserver answering proves it reconnected to the datastore on the new image), an agent via
-// `kubectl wait --for=condition=Ready`. Extracted for clarity and to keep rollOneNode small.
+// waitNodeReady blocks until a recreated node is serving again. A server must first answer on its OWN
+// apiserver (proves it reconnected to the datastore on the new image) before kubectl-via-LB can see
+// it; an agent has no apiserver. THEN both wait for the node to re-register as a Ready k8s Node —
+// the recreate deleted the old Node object, so it must rejoin fresh on its new IP. Extracted to keep
+// rollOneNode small.
 func (p *provisioner) waitNodeReady(ctx context.Context, node NodeInfo, kubeconfig string, logw io.Writer) error {
 	if node.Role == RoleServer {
 		addr, err := p.inspectIPv4(ctx, node.ID)
@@ -262,14 +271,44 @@ func (p *provisioner) waitNodeReady(ctx context.Context, node NodeInfo, kubeconf
 			return fmt.Errorf("node %q: %w", node.Name, err)
 		}
 
-		return p.waitForAPIServer(ctx, addr)
+		if err := p.waitForAPIServer(ctx, addr); err != nil {
+			return err
+		}
 	}
 
-	if err := p.runKubectlErr(ctx, kubectlWaitReadyArgs(kubeconfig, node.Name, k3sUpgradeWaitTimeout), logw); err != nil {
-		return fmt.Errorf("node %q did not become Ready after upgrade: %w", node.Name, err)
-	}
+	return p.waitNodeRegisteredReady(ctx, node.Name, kubeconfig, k3sUpgradeWaitTimeout, logw)
+}
 
-	return nil
+// waitNodeRegisteredReady polls until <node> exists AND reports Ready=True, or timeout. The recreate
+// deletes the Node object first (so the node rejoins on its new IP), so a one-shot `kubectl wait`
+// errors immediately on the not-yet-registered node ("NotFound"); this tolerates that window — and
+// the subsequent NotReady — until the fresh kubelet registers and goes Ready. Polling kubectl-via-LB
+// also confirms the node is visible cluster-wide, which a host-side apiserver TLS dial does not.
+func (p *provisioner) waitNodeRegisteredReady(ctx context.Context, node, kubeconfig string, timeout time.Duration, logw io.Writer) error {
+	deadline := time.Now().Add(timeout)
+	args := kubectlNodeReadyArgs(kubeconfig, node)
+
+	fmt.Fprintln(logw, "waiting for", node, "to re-register Ready")
+
+	var last string
+	for {
+		out, err := exec.CommandContext(ctx, "kubectl", args...).CombinedOutput()
+
+		last = strings.TrimSpace(string(out))
+		if err == nil && last == "True" {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("node %q did not re-register Ready within %s (last: %q)", node, timeout, last)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(apiPollInterval):
+		}
+	}
 }
 
 // runKubectl runs a host kubectl command best-effort, logging a warning on failure but not aborting —

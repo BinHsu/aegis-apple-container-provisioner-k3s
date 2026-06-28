@@ -291,10 +291,12 @@ func TestKubectlArgs(t *testing.T) {
 		}
 	}
 
-	wait := strings.Join(kubectlWaitReadyArgs(kc, "aegis-agent-1", 5*time.Minute), " ")
-	for _, want := range []string{"wait", "--for=condition=Ready", "node/aegis-agent-1", "--timeout=300s"} {
-		if !strings.Contains(wait, want) {
-			t.Errorf("wait args missing %q: %q", want, wait)
+	// The readiness poll reads the Ready condition (tolerating the post-delete NotFound window) rather
+	// than a one-shot `kubectl wait` that errors on the not-yet-re-registered node.
+	ready := strings.Join(kubectlNodeReadyArgs(kc, "aegis-agent-1"), " ")
+	for _, want := range []string{"get node aegis-agent-1", `jsonpath={.status.conditions[?(@.type=="Ready")].status}`} {
+		if !strings.Contains(ready, want) {
+			t.Errorf("node-ready args missing %q: %q", want, ready)
 		}
 	}
 
