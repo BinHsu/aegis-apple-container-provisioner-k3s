@@ -6,7 +6,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 )
+
+// stringList is a flag.Value that ACCUMULATES every occurrence of a repeated flag into a
+// slice, so -k3s-server-arg / -k3s-agent-arg / -node-label / -manifest can each be passed more
+// than once. Each Set appends one value; flag.Visit reports the flag name once if it was given
+// at least once, which is exactly the "explicit" signal applyConfig needs (see precedence).
+type stringList []string
+
+// String renders the accumulated values; required by flag.Value. Comma-joined for help/echo.
+func (s *stringList) String() string { return strings.Join(*s, ",") }
+
+// Set appends one occurrence of the flag's value (the repeated-flag behaviour).
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
+
+	return nil
+}
 
 // fileConfig is the schema for a -config JSON cluster specification.
 // It mirrors the create-time flags so a forker can describe a cluster once
@@ -41,6 +58,46 @@ type fileConfig struct {
 	// cannot distinguish absent-from-file vs explicitly-zero in JSON — see applyConfig.
 	Agents   int    `json:"agents"`
 	StateDir string `json:"stateDir"`
+	// ServerCPUs / AgentCPUs are per-node vCPU counts (v0.4.0). 0 = "not specified" → the
+	// built-in default (2) stays in effect, same zero-value handling as the memory fields.
+	ServerCPUs int `json:"serverCPUs"`
+	AgentCPUs  int `json:"agentCPUs"`
+	// K3sServerArgs / K3sAgentArgs are extra k3s flags appended VERBATIM to the server / agent
+	// subcommand (v0.4.0; the -k3s-server-arg / -k3s-agent-arg passthrough). Empty/absent = none.
+	K3sServerArgs []string `json:"k3sServerArgs"`
+	K3sAgentArgs  []string `json:"k3sAgentArgs"`
+	// NodeLabels are k3s node labels (KEY=VALUE) applied to every node at create (v0.4.0).
+	NodeLabels []string `json:"nodeLabels"`
+	// Manifests are host-side manifest file paths auto-deployed via the bootstrap server (v0.4.0).
+	Manifests []string `json:"manifests"`
+}
+
+// flagRefs bundles pointers to every flag variable applyConfig may overwrite. It replaces the
+// former long positional parameter list (the handoff flagged that ~13 positional args had to
+// become a struct before v0.4.0 added more): grouping them keeps applyConfig's signature stable
+// as config-backed flags grow, and makes the call site self-documenting (field: value) instead
+// of a wall of unlabeled &vars where an argument-order mistake would silently misroute a flag.
+type flagRefs struct {
+	clusterName *string
+	image       *string
+	stateDir    *string
+	network     *string
+	dnsDomain   *string
+	token       *string
+	datastore   *string
+	serverMemMB *int64
+	agentMemMB  *int64
+	serverCount *int
+	agentCount  *int
+	// datastoreMembers is the managed etcd cluster size (v0.3.0); folded into the struct during
+	// the v0.4.0 rebase so the applyConfig refactor and the etcd HA path coexist.
+	datastoreMembers *int
+	serverCPUs       *int
+	agentCPUs        *int
+	serverArgs       *stringList
+	agentArgs        *stringList
+	nodeLabels       *stringList
+	manifests        *stringList
 }
 
 // loadFileConfig reads a JSON cluster specification from path and decodes it into
@@ -82,62 +139,51 @@ func loadFileConfig(path string) (fileConfig, error) {
 //     distinguish absent-from-file from explicitly-zero, the rule is: whenever -config
 //     is supplied and -agents was not set explicitly, the file value (even 0) overrides
 //     the built-in default (1). Include "agents": N in every config file you write.
-//
-// Note (v0.3.0): the positional parameter list is intentionally left as-is rather than refactored
-// into a config struct. The v0.3.0 handoff flagged that refactor, but the API-LB branch this builds
-// on had not done it; the minimal clean change here is one added *int (datastoreMembers). The struct
-// refactor remains a clean follow-up once another field lands.
-func applyConfig(
-	fc fileConfig, explicit map[string]bool,
-	clusterName *string, k3sImage *string, stateDir *string, network *string,
-	dnsDomain *string, token *string, datastore *string,
-	serverMemMB *int64, agentMemMB *int64, serverCount *int, agentCount *int,
-	datastoreMembers *int,
-) {
+func applyConfig(fc fileConfig, explicit map[string]bool, r flagRefs) {
 	if !explicit["name"] && fc.Name != "" {
-		*clusterName = fc.Name
+		*r.clusterName = fc.Name
 	}
 
 	// DNSDomain uses a pointer so "" (IP-only) is distinguishable from absent.
 	if !explicit["dns-domain"] && fc.DNSDomain != nil {
-		*dnsDomain = *fc.DNSDomain
+		*r.dnsDomain = *fc.DNSDomain
 	}
 
 	if !explicit["image"] && fc.Image != "" {
-		*k3sImage = fc.Image
+		*r.image = fc.Image
 	}
 
 	if !explicit["network"] && fc.Network != "" {
-		*network = fc.Network
+		*r.network = fc.Network
 	}
 
 	if !explicit["token"] && fc.Token != "" {
-		*token = fc.Token
+		*r.token = fc.Token
 	}
 
 	if !explicit["datastore-endpoint"] && fc.DatastoreEndpoint != "" {
-		*datastore = fc.DatastoreEndpoint
+		*r.datastore = fc.DatastoreEndpoint
 	}
 
 	if !explicit["server-memory"] && fc.ServerMemoryMB != 0 {
-		*serverMemMB = fc.ServerMemoryMB
+		*r.serverMemMB = fc.ServerMemoryMB
 	}
 
 	if !explicit["agent-memory"] && fc.AgentMemoryMB != 0 {
-		*agentMemMB = fc.AgentMemoryMB
+		*r.agentMemMB = fc.AgentMemoryMB
 	}
 
 	// Servers: 0 is NOT a valid cluster shape, so (unlike Agents) absent-from-file (0)
 	// leaves the built-in default (1) in place rather than overriding it to 0.
 	if !explicit["servers"] && fc.Servers != 0 {
-		*serverCount = fc.Servers
+		*r.serverCount = fc.Servers
 	}
 
 	// DatastoreMembers: like Servers, 0 is NOT a valid value (the managed etcd cluster must be
 	// odd and >=3), so absent-from-file (0) keeps the built-in default (3); only a non-zero file
 	// value overrides it. An invalid non-zero value is rejected later by the provider.
 	if !explicit["datastore-members"] && fc.DatastoreMembers != 0 {
-		*datastoreMembers = fc.DatastoreMembers
+		*r.datastoreMembers = fc.DatastoreMembers
 	}
 
 	// Agents: always apply from file (even 0) unless the flag was explicitly set.
@@ -145,10 +191,46 @@ func applyConfig(
 	// it as 0, so the built-in default (1) is replaced by 0. Always declare "agents"
 	// in a config file if you want a specific count.
 	if !explicit["agents"] {
-		*agentCount = fc.Agents
+		*r.agentCount = fc.Agents
 	}
 
 	if !explicit["state-dir"] && fc.StateDir != "" {
-		*stateDir = fc.StateDir
+		*r.stateDir = fc.StateDir
+	}
+
+	applyV040Config(fc, explicit, r)
+}
+
+// applyV040Config applies the v0.4.0 config-backed flags (per-node CPUs and the four repeated
+// lists). Split out of applyConfig so neither function trips the cognitive-complexity gate; the
+// precedence rules are identical to the rest of applyConfig (file value used only when the
+// matching flag was not set explicitly).
+func applyV040Config(fc fileConfig, explicit map[string]bool, r flagRefs) {
+	// CPUs: 0 = "not specified" → keep the built-in default (2), mirroring the memory fields
+	// (a 0-vCPU node makes no sense, so 0 never overrides).
+	if !explicit["server-cpus"] && fc.ServerCPUs != 0 {
+		*r.serverCPUs = fc.ServerCPUs
+	}
+
+	if !explicit["agent-cpus"] && fc.AgentCPUs != 0 {
+		*r.agentCPUs = fc.AgentCPUs
+	}
+
+	// Repeated-list fields: a non-empty file list overrides the (empty) default when the
+	// matching repeatable flag was not given. len == 0 = "not specified" → not applied.
+	if !explicit["k3s-server-arg"] && len(fc.K3sServerArgs) > 0 {
+		*r.serverArgs = fc.K3sServerArgs
+	}
+
+	if !explicit["k3s-agent-arg"] && len(fc.K3sAgentArgs) > 0 {
+		*r.agentArgs = fc.K3sAgentArgs
+	}
+
+	if !explicit["node-label"] && len(fc.NodeLabels) > 0 {
+		*r.nodeLabels = fc.NodeLabels
+	}
+
+	if !explicit["manifest"] && len(fc.Manifests) > 0 {
+		*r.manifests = fc.Manifests
 	}
 }
