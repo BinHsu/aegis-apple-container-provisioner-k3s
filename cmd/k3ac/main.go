@@ -199,28 +199,12 @@ func run() error {
 		labels: nodeLabels, serverArgs: serverArgs, agentArgs: agentArgs,
 	})
 
-	cfg := apple.ClusterConfig{
-		Name:              *clusterName,
-		Image:             *k3sImage,
-		Network:           *network,
-		StateDir:          *stateDir,
-		Token:             *token,
-		DatastoreEndpoint: *datastore,
-		// Infer managed-datastore (one-command HA): more than one server and no bring-your-own
-		// endpoint means k3ac provisions a managed etcd cluster itself (docs/ADR-0003). With an
-		// explicit -datastore-endpoint the operator owns the datastore (BYO). The provider
-		// validates the rest (e.g. managed HA needs -dns-domain; member count must be odd >=3).
-		ManageDatastore:  *serverCount > 1 && *datastore == "",
-		DatastoreMembers: *datastoreMembers,
-		// Infer the API load balancer: more than one server gets a single front-door endpoint
-		// (<cluster>-api.<domain>) so the kubeconfig + agents target one FQDN that fans out across
-		// servers (docs/ADR/0002, v0.3.0). A single server IS the endpoint, so it gets no LB.
-		// setupAPILB further gates on -dns-domain (the LB is FQDN-addressed) and skips gracefully
-		// when absent. The -config JSON path feeds serverCount, so HA-from-config gets the LB too.
-		ProvisionAPILB: *serverCount > 1,
-		Manifests:      manifests,
-		Nodes:          nodes,
-	}
+	cfg := buildClusterConfig(clusterConfigInputs{
+		name: *clusterName, image: *k3sImage, network: *network, stateDir: *stateDir,
+		token: *token, datastore: *datastore,
+		serverCount: *serverCount, datastoreMembers: *datastoreMembers,
+		manifests: manifests,
+	}, nodes)
 
 	state, err := prov.Create(ctx, cfg, log.Writer())
 	if err != nil {
@@ -230,6 +214,39 @@ func run() error {
 	reportProvisioned(state, *dnsDomain)
 
 	return nil
+}
+
+// clusterConfigInputs are the create-time scalars buildClusterConfig folds into an
+// apple.ClusterConfig, grouped into a struct (same readability reasoning as nodeSpec/flagRefs)
+// so run stays short.
+type clusterConfigInputs struct {
+	name, image, network, stateDir, token, datastore string
+	serverCount, datastoreMembers                    int
+	manifests                                        []string
+}
+
+// buildClusterConfig assembles the provider ClusterConfig from the resolved flags and node set.
+// ManageDatastore and ProvisionAPILB are INFERRED from server count (more than one server, no
+// bring-your-own datastore) — k3ac provisions a managed etcd cluster (docs/ADR-0003) behind a
+// single API-LB front door (<cluster>-api.<domain>, docs/ADR/0002, v0.3.0). With an explicit
+// -datastore-endpoint the operator owns the datastore (BYO). The provider validates the rest
+// (managed HA needs -dns-domain; etcd member count must be odd >=3; setupAPILB skips the LB
+// gracefully without a DNS domain). The -config JSON path feeds serverCount, so HA-from-config
+// gets both the managed datastore and the LB.
+func buildClusterConfig(in clusterConfigInputs, nodes []apple.NodeConfig) apple.ClusterConfig {
+	return apple.ClusterConfig{
+		Name:              in.name,
+		Image:             in.image,
+		Network:           in.network,
+		StateDir:          in.stateDir,
+		Token:             in.token,
+		DatastoreEndpoint: in.datastore,
+		ManageDatastore:   in.serverCount > 1 && in.datastore == "",
+		DatastoreMembers:  in.datastoreMembers,
+		ProvisionAPILB:    in.serverCount > 1,
+		Manifests:         in.manifests,
+		Nodes:             nodes,
+	}
 }
 
 // nodeSpec is the create-time node-set request, grouped into a struct so buildNodes takes one

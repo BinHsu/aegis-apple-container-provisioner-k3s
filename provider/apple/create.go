@@ -32,6 +32,30 @@ import (
 //	  -> assertDistinctIPs -> saveState
 //
 // `container run` pulls the image on demand, so there is no explicit image-pull step.
+// launchAgents launches every agent node pointed at serverURL (the LB FQDN when an LB was
+// provisioned, else the bootstrap server), arming ip_forward on each. Extracted from Create to
+// keep it readable and under the cognitive-complexity gate.
+func (p *provisioner) launchAgents(ctx context.Context, cfg ClusterConfig, agents []NodeConfig, serverURL string, logw io.Writer) ([]NodeInfo, error) {
+	var infos []NodeInfo
+
+	for _, agent := range agents {
+		fmt.Fprintln(logw, "launching k3s agent", agent.Name, "->", serverURL)
+
+		info, err := p.launchNode(ctx, cfg, agent, serverURL, "")
+		if err != nil {
+			return nil, err
+		}
+
+		if err := p.enableIPForward(ctx, info.ID); err != nil {
+			return nil, fmt.Errorf("agent %q: %w", agent.Name, err)
+		}
+
+		infos = append(infos, info)
+	}
+
+	return infos, nil
+}
+
 func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Writer) (ClusterState, error) {
 	if logw == nil {
 		logw = io.Discard
@@ -180,20 +204,13 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 	}
 
 	// 5) Launch AGENT nodes pointed at the server endpoint (the LB FQDN when an LB was provisioned).
-	for _, agent := range agents {
-		fmt.Fprintln(logw, "launching k3s agent", agent.Name, "->", serverURL)
-
-		info, err := p.launchNode(ctx, cfg, agent, serverURL, "")
-		if err != nil {
-			return ClusterState{}, err
-		}
-
-		if err := p.enableIPForward(ctx, info.ID); err != nil {
-			return ClusterState{}, fmt.Errorf("agent %q: %w", agent.Name, err)
-		}
-
-		nodes = append(nodes, info)
+	// Extracted to launchAgents to keep Create readable and under the cognitive-complexity gate.
+	agentInfos, err := p.launchAgents(ctx, cfg, agents, serverURL, logw)
+	if err != nil {
+		return ClusterState{}, err
 	}
+
+	nodes = append(nodes, agentInfos...)
 
 	// Record the managed datastore (etcd) members FIRST in state, so teardown and reporting see
 	// them. They are not k3s nodes — they carry no kubeconfig and join no k3s cluster — but they
