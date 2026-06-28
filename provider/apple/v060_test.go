@@ -80,6 +80,34 @@ func TestSnapshotPathConstruction(t *testing.T) {
 // TestBuildEtcdSnapshotArgs locks the snapshot helper recipe: a WRITABLE host backup mount (so the
 // snapshot lands on the host), a read-only client TLS mount, the etcdctl client TLS flags, the FQDN
 // client endpoint, and `snapshot save /backup/<file>`. Image falls back to the etcd default.
+// TestEtcdctlHealthArgs locks the quorum-gate command (the provision-flakiness fix): it must carry
+// the member's mutual-TLS bundle (ca + server cert/key under etcdTLSMount), the target endpoint,
+// and the `endpoint health` verb — the invocation whose success proves a leader exists before the
+// bootstrap k3s server launches (a bare TCP dial did not, which fatal-exited the first server).
+func TestEtcdctlHealthArgs(t *testing.T) {
+	args := etcdctlHealthArgs("https://aegis-etcd-1.aegis:2379")
+	joined := strings.Join(args, " ")
+
+	checks := []struct {
+		ok   bool
+		desc string
+	}{
+		{len(args) > 0 && args[0] == "etcdctl", "etcdctl is the executable"},
+		{slices.Contains(args, "endpoint") && slices.Contains(args, "health"), "the 'endpoint health' verb is present"},
+		{hasPair(args, "--cacert", etcdTLSMount+"/"+etcdCACertFile), "CA from the member's TLS mount"},
+		{hasPair(args, "--cert", etcdTLSMount+"/"+etcdServerCertFile), "member server cert (mutual-TLS client)"},
+		{hasPair(args, "--key", etcdTLSMount+"/"+etcdServerKeyFile), "member server key"},
+		{hasPair(args, "--endpoints", "https://aegis-etcd-1.aegis:2379"), "the target endpoint"},
+		{!strings.Contains(joined, "http://"), "TLS only — no plaintext endpoint"},
+	}
+
+	for _, c := range checks {
+		if !c.ok {
+			t.Errorf("etcdctl health args check failed: %s\nargs: %s", c.desc, joined)
+		}
+	}
+}
+
 func TestBuildEtcdSnapshotArgs(t *testing.T) {
 	cfg := recipeCfg()
 	args := buildEtcdSnapshotArgs(cfg, "aegis-etcd-snapshot", "aegis-etcd-1.aegis",
@@ -267,6 +295,15 @@ func TestKubectlArgs(t *testing.T) {
 	for _, want := range []string{"wait", "--for=condition=Ready", "node/aegis-agent-1", "--timeout=300s"} {
 		if !strings.Contains(wait, want) {
 			t.Errorf("wait args missing %q: %q", want, wait)
+		}
+	}
+
+	// delete-node clears the stale Node object before recreate so the node rejoins on its new DHCP
+	// IP; --ignore-not-found keeps it idempotent across retries.
+	del := strings.Join(kubectlDeleteNodeArgs(kc, "aegis-agent-1"), " ")
+	for _, want := range []string{"delete node aegis-agent-1", "--ignore-not-found"} {
+		if !strings.Contains(del, want) {
+			t.Errorf("delete-node args missing %q: %q", want, del)
 		}
 	}
 }

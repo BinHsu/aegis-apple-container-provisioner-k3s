@@ -457,6 +457,18 @@ func (p *provisioner) provisionEtcdCluster(ctx context.Context, cfg ClusterConfi
 		}
 	}
 
+	// A dialable client port proves each member's process is up, NOT that the cluster has elected a
+	// leader. The BOOTSTRAP k3s server (unlike the joiners) fatal-exits if it cannot reach a WORKING
+	// datastore within its own short bootstrap window — under load, etcd leader election can lose
+	// that race. So gate the server launch on actual QUORUM: etcdctl endpoint health inside the
+	// first member succeeds only once a proposal can commit, which requires a leader.
+	first := infos[0]
+	firstEndpoint := "https://" + net.JoinHostPort(nodeFQDN(first.Name, p.dnsDomain), strconv.Itoa(etcdClientPort))
+
+	if err := p.waitForEtcdQuorum(ctx, first.ID, firstEndpoint); err != nil {
+		return nil, "", "", fmt.Errorf("etcd cluster %q quorum: %w", cfg.Name, err)
+	}
+
 	return infos, etcdDatastoreEndpoint(cfg.Name, p.dnsDomain, count), clientTLSDir, nil
 }
 
@@ -629,6 +641,55 @@ func (p *provisioner) enableIPForward(ctx context.Context, id string) error {
 	}
 
 	return nil
+}
+
+// etcdQuorumTimeout bounds the wait for the etcd cluster to elect a leader after every member's
+// client port is open. Leader election is normally sub-second but can lag under host load; this
+// margin keeps a slow election from racing the bootstrap server's own (shorter) datastore-connect
+// window, which would otherwise fatal-exit the first k3s server.
+const etcdQuorumTimeout = 90 * time.Second
+
+// etcdctlHealthArgs builds the in-member etcdctl invocation that proves the cluster has QUORUM:
+// `endpoint health` succeeds only when the member can commit a proposal, which requires a leader.
+// It runs INSIDE an etcd member, where that member's own server cert (bind-mounted at etcdTLSMount)
+// authenticates the mutual-TLS client. Pure, so the command is unit-testable.
+func etcdctlHealthArgs(endpoint string) []string {
+	return []string{
+		"etcdctl",
+		"--cacert", etcdTLSMount + "/" + etcdCACertFile,
+		"--cert", etcdTLSMount + "/" + etcdServerCertFile,
+		"--key", etcdTLSMount + "/" + etcdServerKeyFile,
+		"--endpoints", endpoint,
+		"endpoint", "health",
+	}
+}
+
+// waitForEtcdQuorum polls etcdctl endpoint health inside memberID until the cluster can commit a
+// proposal (a leader is elected = quorum) or the timeout elapses. This gates the bootstrap k3s
+// server launch: that server fatal-exits if its datastore is not already serving, so a bare TCP
+// dial (waitForEtcdMember) is not sufficient — the cluster must be write-ready first.
+func (p *provisioner) waitForEtcdQuorum(ctx context.Context, memberID, endpoint string) error {
+	deadline := time.Now().Add(etcdQuorumTimeout)
+	args := etcdctlHealthArgs(endpoint)
+
+	var lastErr error
+	for {
+		_, err := p.exec(ctx, memberID, args...)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("etcd quorum not reached within %s: %w", etcdQuorumTimeout, lastErr)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(apiPollInterval):
+		}
+	}
 }
 
 // readyTimeout bounds how long we wait for the k3s API server to start answering on
