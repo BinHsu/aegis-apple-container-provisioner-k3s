@@ -62,6 +62,17 @@ type NodeConfig struct {
 	Role     Role
 	Memory   int64 // bytes
 	NanoCPUs int64 // nano-CPUs (1e9 == 1 vCPU)
+	// Labels are k3s node labels (KEY=VALUE), each emitted as a --node-label on the node's
+	// k3s server/agent subcommand (v0.4.0). Applied to whichever role this node is. Empty =
+	// no extra labels. The caller (cmd driver) sets the same list on every node it builds.
+	Labels []string
+	// ExtraArgs are operator-supplied k3s flags appended VERBATIM to this node's k3s
+	// subcommand AFTER every built-in flag (v0.4.0; -k3s-server-arg / -k3s-agent-arg). k3s
+	// is last-one-wins on repeated flags, so these can override built-ins as well as add new
+	// ones — disable traefik, change the CNI/flannel backend, set --cluster-cidr, enable
+	// ServiceLB, etc. The caller resolves the per-role list (server args onto server nodes,
+	// agent args onto agent nodes). Empty = none.
+	ExtraArgs []string
 }
 
 // ClusterConfig is the full request to Create.
@@ -106,6 +117,13 @@ type ClusterConfig struct {
 	// domain and skips gracefully (no LB, keep pointing at the bootstrap server) when absent. The
 	// LB node is NOT listed in Nodes — Create provisions it separately.
 	ProvisionAPILB bool
+	// Manifests are host-side Kubernetes manifest file paths bind-mounted into the BOOTSTRAP
+	// server's k3s auto-deploy dir (/var/lib/rancher/k3s/server/manifests) so k3s applies them
+	// at startup (v0.4.0). Each file is mounted INDIVIDUALLY (not the whole directory) so k3s's
+	// own generated manifests living in the named-volume datastore are not shadowed. Create
+	// resolves these to absolute paths (the `container` runtime requires absolute bind sources)
+	// and rejects basename collisions before launch. Empty = none.
+	Manifests []string
 	// Nodes are the nodes to launch (server first is enforced by Create's ordering). The
 	// managed datastore and the API LB are NOT listed here — Create provisions them separately.
 	Nodes []NodeConfig

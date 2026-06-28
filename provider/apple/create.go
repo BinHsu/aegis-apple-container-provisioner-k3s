@@ -115,6 +115,21 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		return ClusterState{}, fmt.Errorf("creating cluster state dir %q: %w", clusterDir, err)
 	}
 
+	// AUTO-DEPLOY MANIFESTS (v0.4.0): resolve each requested manifest to an absolute path
+	// (the `container` runtime resolves a relative bind source against the container root —
+	// same absolute-path requirement as the kubeconfig mount above), confirm it exists, and
+	// reject basename collisions (two files would mount to the same in-node path). Done once,
+	// before any launch, so a bad -manifest fails fast instead of mid-bring-up. buildRunArgs
+	// mounts the resolved paths into the bootstrap server only.
+	if len(cfg.Manifests) > 0 {
+		resolved, err := resolveManifests(cfg.Manifests)
+		if err != nil {
+			return ClusterState{}, err
+		}
+
+		cfg.Manifests = resolved
+	}
+
 	// 1) Launch the SERVER node. clusterDir is bind-mounted so k3s writes the kubeconfig
 	// straight to the host (see the note above).
 	fmt.Fprintln(logw, "launching k3s server", server.Name)
@@ -693,6 +708,54 @@ func validateClusterConfig(cfg ClusterConfig) error {
 	}
 
 	return nil
+}
+
+// resolveManifests turns the requested host manifest paths into absolute paths, confirms
+// each exists and is a regular file, and rejects basename collisions. It is the create-time
+// guard for the -manifest / auto-deploy feature (v0.4.0): each manifest is bind-mounted into
+// the bootstrap server at k3sManifestsDir/<basename>, so two paths sharing a basename would
+// collide at the same in-node target and one would silently win. The `container` runtime also
+// requires an absolute bind source. Returns the resolved absolute paths in input order.
+//
+// Boundaries (BVA, CLAUDE.md k): zero manifests is handled by the caller (this is only called
+// for len > 0); one manifest passes; many distinct basenames pass; an empty path, a missing
+// file, a directory, and a duplicate basename each error.
+func resolveManifests(manifests []string) ([]string, error) {
+	resolved := make([]string, 0, len(manifests))
+	seen := make(map[string]string, len(manifests)) // basename -> first path that claimed it
+
+	for _, m := range manifests {
+		if m == "" {
+			return nil, fmt.Errorf("manifest path is empty")
+		}
+
+		abs, err := filepath.Abs(m)
+		if err != nil {
+			return nil, fmt.Errorf("resolving manifest path %q: %w", m, err)
+		}
+
+		info, err := os.Stat(abs)
+		if err != nil {
+			return nil, fmt.Errorf("manifest %q: %w", m, err)
+		}
+
+		if info.IsDir() {
+			return nil, fmt.Errorf("manifest %q is a directory; pass individual manifest files "+
+				"(each is mounted at %s/<basename>)", m, k3sManifestsDir)
+		}
+
+		base := filepath.Base(abs)
+		if other, dup := seen[base]; dup {
+			return nil, fmt.Errorf("manifest basename collision: %q and %q both mount to %s/%s — "+
+				"rename one so each manifest has a distinct filename", other, m, k3sManifestsDir, base)
+		}
+
+		seen[base] = m
+
+		resolved = append(resolved, abs)
+	}
+
+	return resolved, nil
 }
 
 // prepareNodeVolumes creates each node's k3s datastore named volume, and guards

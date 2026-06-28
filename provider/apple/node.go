@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +27,14 @@ const k3sDatastoreMount = "/var/lib/rancher/k3s"
 
 // k3sAPIPort is the k3s API server / join port.
 const k3sAPIPort = 6443
+
+// k3sManifestsDir is k3s's auto-deploy directory inside a server node. k3s applies every
+// manifest that lands here at startup (the "auto-deploying manifests" feature). It sits UNDER
+// the datastore mount (/var/lib/rancher/k3s), so v0.4.0's -manifest support bind-mounts each
+// host manifest file INDIVIDUALLY at <this>/<basename> rather than mounting the whole directory
+// — a directory mount would shadow k3s's own generated manifests (traefik, coredns,
+// local-storage, metrics-server) that live in the named volume. See manifestMountArgs.
+const k3sManifestsDir = k3sDatastoreMount + "/server/manifests"
 
 // Managed datastore (external etcd cluster) recipe constants. v0.3.0 supersedes ADR-0002's
 // single-Postgres datastore with an auto-provisioned N-node etcd cluster as the default HA
@@ -481,6 +490,15 @@ func buildRunArgs(cfg ClusterConfig, node NodeConfig, serverURL, dnsDomain, kube
 	// block-backed named volume above).
 	if node.Role == RoleServer && kubeconfigHostDir != "" {
 		args = append(args, "--volume", kubeconfigHostDir+":"+kubeconfigMount)
+
+		// AUTO-DEPLOY MANIFESTS (v0.4.0): bind-mount each host manifest file into the
+		// bootstrap server's k3s auto-deploy dir so k3s applies it at startup. Same
+		// virtio-fs bind-mount mechanism the kubeconfig uses (ADR-0001) — a plain file
+		// share, no guest agent. Only the bootstrap server (kubeconfigHostDir != "")
+		// mounts them: auto-deploy AddOn state is recorded in the shared datastore, so
+		// applying once is enough even in HA. cfg.Manifests is absolute by here (Create
+		// resolved + collision-checked it). agents and HA join servers get nothing.
+		args = append(args, manifestMountArgs(cfg.Manifests)...)
 	}
 
 	// Labels: k3s.* replacing the Talos sibling's talos.* scheme. Node IDs are also
@@ -567,6 +585,41 @@ func buildRunArgs(cfg ClusterConfig, node NodeConfig, serverURL, dnsDomain, kube
 				args = append(args, "--tls-san", clusterAPIFQDN(cfg.Name, dnsDomain))
 			}
 		}
+	}
+
+	// NODE LABELS (v0.4.0): both server and agent accept --node-label KEY=VALUE. Emitted
+	// after the role-specific built-in flags and before the verbatim passthrough so an
+	// operator-supplied --k3s-*-arg can still override anything here (k3s is last-one-wins).
+	for _, label := range node.Labels {
+		args = append(args, "--node-label", label)
+	}
+
+	// K3S-ARG PASSTHROUGH (v0.4.0): operator-supplied k3s flags appended VERBATIM, LAST, so
+	// they sit after every built-in flag and win on conflicts (k3s last-one-wins). This is the
+	// "open the closed box" escape hatch: --disable=traefik, --flannel-backend=vxlan,
+	// --cluster-cidr=..., enable ServiceLB, etc. The caller resolves the per-role list (server
+	// args onto servers, agent args onto agents); a nil ExtraArgs appends nothing.
+	args = append(args, node.ExtraArgs...)
+
+	return args
+}
+
+// manifestMountArgs returns the `--volume <hostpath>:<target>` pairs that bind-mount each
+// host manifest file into the bootstrap server's k3s auto-deploy dir (k3sManifestsDir). Pure
+// so the mount-path construction is unit-testable (BVA: zero / one / many manifests) without
+// launching a VM. Each manifest mounts INDIVIDUALLY at k3sManifestsDir/<basename>, leaving
+// k3s's own generated manifests in the named volume intact. hostPaths are expected absolute
+// (Create resolves + collision-checks them via resolveManifests); a nil/empty slice yields nil.
+func manifestMountArgs(hostPaths []string) []string {
+	if len(hostPaths) == 0 {
+		return nil
+	}
+
+	args := make([]string, 0, len(hostPaths)*2)
+
+	for _, hostPath := range hostPaths {
+		target := k3sManifestsDir + "/" + filepath.Base(hostPath)
+		args = append(args, "--volume", hostPath+":"+target)
 	}
 
 	return args

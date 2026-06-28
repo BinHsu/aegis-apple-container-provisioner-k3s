@@ -127,6 +127,17 @@ func (p *provisioner) stop(ctx context.Context, id string) error {
 	return err
 }
 
+// start starts a single stopped node via `container start <id>`. CRITICAL: `container start`
+// accepts only ONE container id per invocation (unlike `container stop`, which takes several) —
+// docs/ADR/0002 — so Start loops one id at a time. Unlike stop/remove this does NOT swallow
+// "not found": starting a node the recorded state expects to exist, but which is gone, is a real
+// error the operator should see.
+func (p *provisioner) start(ctx context.Context, id string) error {
+	_, err := p.run(ctx, "start", id)
+
+	return err
+}
+
 // remove removes a node, ignoring "not found" so teardown is idempotent.
 func (p *provisioner) remove(ctx context.Context, id string) error {
 	_, err := p.run(ctx, "rm", id)
