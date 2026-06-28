@@ -36,8 +36,13 @@ const (
 	// forms a 3-member FQDN-addressed cluster under Apple container and survives the cold-restart
 	// DHCP IP shift. Use this exact tag.
 	defaultEtcdImage = "quay.io/coreos/etcd:v3.5.16"
-	etcdClientPort   = 2379 // client/API port; k3s --datastore-endpoint targets this
-	etcdPeerPort     = 2380 // peer port for member-to-member quorum traffic
+	// etcdBinary is the in-image etcd executable. The image sets Cmd=["/usr/local/bin/etcd"] but
+	// NO ENTRYPOINT, and Apple `container` execs the first post-image arg as the target binary, so
+	// we must name it explicitly — otherwise a bare flag like --name is taken as the executable and
+	// the member dies with `failed to find target executable --name` (caught in v0.3.0 hardware bring-up).
+	etcdBinary     = "/usr/local/bin/etcd"
+	etcdClientPort = 2379 // client/API port; k3s --datastore-endpoint targets this
+	etcdPeerPort   = 2380 // peer port for member-to-member quorum traffic
 	// etcdDataMount is the in-node mount point of the member's named volume. etcdDataDir is a
 	// SUBDIR of it: an ext4 named volume ships a lost+found at the mount root, which etcd refuses
 	// as a data dir (ADR-0003 gotcha, mirrors the Postgres PGDATA-subdir guard in ADR-0002).
@@ -269,9 +274,12 @@ func buildEtcdRunArgs(cfg ClusterConfig, node NodeConfig, dnsDomain, initialClus
 		args = append(args, "--network", cfg.Network)
 	}
 
-	// Image, then the etcd flags (the etcd image ENTRYPOINT is the etcd binary, so trailing args
-	// are etcd flags — same shape as a k3s node's `server`/`agent` subcommand after the image).
-	args = append(args, defaultEtcdImage,
+	// Image, the etcd binary, then the etcd flags. Apple `container` execs the first post-image arg
+	// as the target executable; the etcd image sets Cmd=["/usr/local/bin/etcd"] but NO ENTRYPOINT,
+	// so the binary must be named explicitly (a bare --name would otherwise be taken as the
+	// executable). The trailing args are then etcd flags — same shape as a k3s node's
+	// `server`/`agent` subcommand after the image.
+	args = append(args, defaultEtcdImage, etcdBinary,
 		"--name", node.Name, // etcd MEMBER name (bare); must match this member's key in --initial-cluster
 		"--data-dir", etcdDataDir, // subdir of the mount: the ext4 lost+found blocks etcd at the root
 		"--listen-peer-urls", fmt.Sprintf("http://0.0.0.0:%d", etcdPeerPort),

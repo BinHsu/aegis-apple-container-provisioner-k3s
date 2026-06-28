@@ -324,8 +324,12 @@ func TestBuildEtcdRunArgs(t *testing.T) {
 		{!tmpfsContains(args, "/run") && !tmpfsContains(args, "/tmp"), "NO tmpfs (not a k3s node)"},
 		{!hasNamedDatastoreVolume(args), "NO k3s /var/lib/rancher/k3s datastore volume"},
 		{!strings.Contains(joined, "--cluster-init"), "NO --cluster-init (this is EXTERNAL etcd, not embedded)"},
-		{imageIndex(args, defaultEtcdImage) >= 0, "etcd image present"},
-		{imageIndex(args, defaultEtcdImage) < len(args)-1, "etcd flags follow the image (image is NOT the final arg)"},
+		{etcdImageIndex(args) >= 0, "etcd image present"},
+		{etcdImageIndex(args) < len(args)-1, "etcd flags follow the image (image is NOT the final arg)"},
+		// REGRESSION (v0.3.0 hardware bring-up): the token IMMEDIATELY after the image must be the
+		// etcd binary. The image has no ENTRYPOINT, so Apple `container` execs the first post-image
+		// arg; if that is a flag (e.g. --name) the member dies "failed to find target executable".
+		{etcdImageIndex(args) >= 0 && args[etcdImageIndex(args)+1] == etcdBinary, "etcd binary is the first arg after the image (not a flag)"},
 	}
 
 	for _, c := range checks {
@@ -1108,8 +1112,9 @@ func subcommandIs(args []string, image, sub string) bool {
 	return false
 }
 
-// imageIndex returns the position of the image positional in args, or -1 if absent. Used to
-// assert the image's placement relative to trailing flags (etcd flags follow the image).
-func imageIndex(args []string, image string) int {
-	return slices.Index(args, image)
+// etcdImageIndex returns the position of the etcd image positional in args, or -1 if absent.
+// Used to assert the image's placement relative to trailing flags (the binary and etcd flags
+// must follow the image).
+func etcdImageIndex(args []string) int {
+	return slices.Index(args, defaultEtcdImage)
 }
