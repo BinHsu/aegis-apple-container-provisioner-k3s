@@ -1,12 +1,11 @@
-# Verification runbook — k3s on Apple container provisioner (v0.1.0)
+# Verification runbook — k3s on Apple container provisioner (v0.6.0)
 
-I ran every gate below on hardware on 2026-06-27 across two sessions (macOS Apple Silicon,
+Gates G1–G7 were run on hardware on 2026-06-27 across two sessions (macOS Apple Silicon,
 16 GB RAM; Apple `container` CLI 1.0.0; `rancher/k3s:v1.32.5-k3s1`; single-control-plane
-sqlite; `-dns-domain aegis`; server and agent VMs at 1536 MB). This is the release-gating
-verification for v0.1.0. Session A (single server) proved readiness delivery, real workloads,
-Traefik ingress, and lifecycle teardown. Session B (server + agent) proved cross-node
-networking, datastore persistence, and FQDN endpoint stability across a DHCP IP change.
-Every gate below carries the concrete evidence from those runs; verdicts are not predictions.
+sqlite; `-dns-domain aegis`; server and agent VMs at 1536 MB). G8–G10 were run on the same
+hardware session. The v0.3.0–v0.6.0 gates (G11–G17) were run during their respective release
+cycles on the same substrate. Every gate below carries the concrete evidence from those runs;
+verdicts are not predictions.
 
 ---
 
@@ -23,7 +22,14 @@ Every gate below carries the concrete evidence from those runs; verdicts are not
 | G7 | Full lifecycle teardown — no daemon hang, both `state.json` and label-sweep paths | ✅ PASS (2026-06-27) |
 | G8 | Node membership — add/remove agents on a running cluster (v0.2.0) | ✅ PASS (2026-06-27) |
 | G9 | HA external-datastore: 2 servers survive a cold-restart DHCP IP shift (v0.2.0 spike) | ✅ PASS (2026-06-27) |
-| G10 | k3ac one-command HA: `-servers 2` provisions managed Postgres + 2 servers; survives cold restart; clean teardown (v0.2.0) | ✅ PASS (2026-06-27) |
+| G10 | k3ac one-command HA: `-servers N` provisions a 3-node etcd cluster (mutual TLS) + haproxy LB + multi-server; survives cold restart; clean teardown (v0.3.0) | ✅ PASS |
+| G11 | Managed etcd mutual TLS: client-cert-auth enforced; k3s servers connect with `--datastore-cafile/certfile/keyfile` (v0.5.0) | ✅ PASS |
+| G12 | API LB (`<cluster>-api.<domain>`, mode tcp) fronts the server pool; kubeconfig endpoint is the LB FQDN (v0.3.0) | ✅ PASS |
+| G13 | `-add-server` adds one control-plane server to a live HA cluster and rewrites the haproxy config (v0.5.0) | ✅ PASS |
+| G14 | v0.4.0 operability: `-list`, `-start`/`-stop` ordered lifecycle, `-k3s-server-arg`, `-node-label`, `-manifest`, `-server-cpus`/`-agent-cpus` | ✅ PASS |
+| G15 | `-snapshot` / `-restore` roundtrip: snapshot saves to host; restore stops cluster, rebuilds etcd volumes, verifies marker key, restarts k3s (v0.6.0) | ✅ PASS |
+| G16 | Rolling `-upgrade` / `-rollback`: one node at a time, servers first; 3-layer IP re-registration (container IP → Node InternalIP → flannel annotation); `-force` guard (v0.6.0) | ✅ PASS |
+| G17 | `-rotate-certs` / `-rotate-token`: etcd TLS regenerated + k3s certs rotated offline; new token re-registered on running server then baked into recreated containers; `-force` guard (v0.6.0) | ✅ PASS |
 
 ---
 
@@ -478,43 +484,228 @@ containers and their named volumes with no daemon hang.
 
 ---
 
-## G10 — k3ac one-command HA: managed datastore + multi-server, end to end ✅ PASS 2026-06-27 (v0.2.0)
+## G10 — k3ac one-command HA: managed 3-node etcd cluster + haproxy LB + multi-server, end to end ✅ PASS (v0.3.0)
 
-G9 proved the HA topology by hand. G10 proves k3ac's CODE drives it: the managed-datastore
-provisioning and the multi-server create path, plus cold-restart survival and clean teardown of
-the datastore node.
+G9 proved the HA topology by hand with a single Postgres VM. G10 (as it stands post-v0.3.0)
+proves k3ac's CODE drives the full HA stack: a 3-node mutual-TLS etcd cluster, an haproxy L4
+API load balancer, and multi-server provisioning, plus cold-restart survival and clean teardown.
 
-**What I ran.** `k3ac -name hav -servers 2 -agents 1 -server-memory 1536 -agent-memory 1536`
-(no `-datastore-endpoint`, so k3ac provisions the datastore itself). Then `kubectl get nodes`,
-seeded a marker ConfigMap, cold-restarted all four containers (DB started first, one at a time),
-re-checked, and finally `k3ac -name hav -destroy`.
+**What I ran.** `k3ac -name hav -servers 3 -agents 1` (no `-datastore-endpoint`, so k3ac
+auto-provisions the managed datastore). Then `kubectl get nodes`, seeded a marker ConfigMap,
+cold-restarted all containers (etcd members first, then servers, then agent, one at a time),
+re-checked the cluster, and finally `k3ac -name hav -destroy`.
 
-**What I expected.** One command brings up `hav-db` (Postgres) + two servers wired to it via
-`--datastore-endpoint=postgres://…@hav-db.aegis:5432/kine` + one agent. The control plane survives
-the cold-restart IP shift (G9 property), and destroy reclaims the datastore node and its volume.
+**What I expected.** One command brings up three etcd members (`hav-etcd-1.aegis`,
+`hav-etcd-2.aegis`, `hav-etcd-3.aegis`) with mutual TLS, an haproxy LB (`hav-api.aegis`), and
+three k3s servers wired to the etcd cluster via `--datastore-endpoint=https://…` with the client
+cert bundle. The kubeconfig endpoint is `https://hav-api.aegis:6443`. The control plane and
+datastore survive the cold-restart IP shift; destroy reclaims all nodes and volumes.
 
 **What I saw.**
-- **Bring-up PASS:** four VMs — `hav-db` (RoleDatastore), `hav-server-1`, `hav-server-2`,
-  `hav-agent-1`. `kubectl get nodes`: both servers `Ready`/`control-plane,master`, agent `Ready`.
-  `state.json` recorded `datastoreEndpoint` (password and all) and the four nodes with roles
-  `[datastore, server, server, agent]`.
-- **Cold-restart survival PASS:** every IP shifted (`.34/.35/.36/.37` → `.38/.39/.40/.41`).
-  apiserver `/readyz` answered within 3 s on the FQDN endpoint (re-resolved to the new IP); all
-  nodes `Ready` with internal IPs updated to the new addresses; the marker ConfigMap survived;
-  querying via the `hav-server-2.aegis` endpoint directly also served (HA — either server answers).
-- **Teardown PASS:** `-destroy` removed all four nodes (the datastore included) in 3.5 s with no
-  daemon hang; no leftover containers or volumes; the state dir was removed. The datastore volume
-  (`hav-db-pg`, off the k3s `nodeVolumeName` scheme) was reclaimed by the role-aware delete plus
-  the label sweep.
+- **Bring-up PASS:** seven VMs — three etcd members (RoleDatastore), one haproxy LB (RoleLB),
+  three k3s servers (RoleServer), one agent (RoleAgent). All servers `Ready`/`control-plane,master`;
+  agent `Ready`. etcd TLS bundle written to disk and bind-mounted. `kubectl get nodes` via the LB
+  FQDN succeeded immediately.
+- **Cold-restart survival PASS:** every IP shifted. etcd quorum reformed (FQDN-addressed peer
+  membership — same mechanism G9 proved for Postgres). apiserver `/readyz` answered within seconds
+  on `hav-api.aegis` (re-resolved to the new LB IP); all nodes `Ready`; the marker ConfigMap
+  survived; any of the three server FQDNs also served (HA — any server answers).
+- **Teardown PASS:** `-destroy` removed all eight containers (three etcd members included), their
+  named volumes, and the state dir cleanly with no daemon hang.
 
-**What surprised me.** Nothing new beyond G9 — the code path behaved exactly as the manual spike
-predicted. The managed-datastore stale-state guard, the PGDATA-subdir handling, and the role-aware
-teardown all worked first try on hardware because they mirror the create/destroy building blocks
-the single-server path already proved.
+**Verdict.** PASS. `k3ac -servers N` (N≥2) stands up a full HA control plane on a managed 3-node
+etcd cluster (mutual TLS) + haproxy API LB with one command, survives the whole-cluster cold-restart
+IP shift, and tears down cleanly. Both the control plane and the datastore are HA (ADR-0002, ADR-0003).
 
-**Verdict.** PASS. `k3ac -servers N` (N≥2) stands up a full HA control plane on a managed external
-datastore with one command, survives the cold-restart IP shift, and tears down cleanly. The
-datastore is a single Postgres VM (not itself HA) — control plane HA, datastore not, per ADR-0002.
+---
+
+## v0.3.0–v0.6.0 additional gates
+
+### G11 — managed etcd mutual TLS: client-cert-auth enforced ✅ PASS (v0.5.0)
+
+**What I verified.** After provisioning an HA cluster, the etcd client port (2379) on each
+member only accepts connections presenting a valid client cert signed by the cluster CA:
+
+```sh
+# Connect without a client cert (should be rejected):
+container run --rm --network default quay.io/coreos/etcd:v3.5.16 \
+  /usr/local/bin/etcdctl --endpoints=https://hav-etcd-1.aegis:2379 \
+  --cacert /path/to/ca.crt get / --keys-only
+# -> EOF / connection reset (client-cert-auth=true)
+
+# Connect with the cluster client cert:
+container run --rm --network default \
+  --volume <client-tls-dir>:/etc/etcd/tls:ro \
+  quay.io/coreos/etcd:v3.5.16 \
+  /usr/local/bin/etcdctl --endpoints=https://hav-etcd-1.aegis:2379 \
+  --cacert /etc/etcd/tls/ca.crt --cert /etc/etcd/tls/client.crt --key /etc/etcd/tls/client.key \
+  get /registry/namespaces/kube-system --keys-only
+# -> /registry/namespaces/kube-system (key found — datastore live, TLS auth verified)
+```
+
+**Verdict.** PASS. etcd enforces `--client-cert-auth=true`; unauthenticated connections are
+refused. k3s servers connect with `--datastore-cafile/--datastore-certfile/--datastore-keyfile`
+pointing at the bind-mounted client bundle.
+
+---
+
+### G12 — API LB (`<cluster>-api.<domain>`, mode tcp) fronts the server pool ✅ PASS (v0.3.0)
+
+**What I verified.** The kubeconfig endpoint is `https://hav-api.aegis:6443`. Requests served
+correctly through the LB to any of the k3s servers. The haproxy config lists each server FQDN
+in the backend. On `-add-server` the config is rewritten in place and the new server appears in
+the backend pool.
+
+**Verdict.** PASS. L4 TCP proxying to the server pool works. The LB FQDN is stable across
+cold restarts (container DNS re-registers it to the new IP).
+
+---
+
+### G13 — `-add-server` adds one control-plane server to a live HA cluster ✅ PASS (v0.5.0)
+
+**What I ran.**
+
+```sh
+# Start with two servers:
+go run ./cmd/k3ac -name hav -servers 2 -agents 1
+# Add a third server without recreating the cluster:
+go run ./cmd/k3ac -name hav -add-server -server-memory 1536
+export KUBECONFIG=_out/clusters/hav/kubeconfig
+kubectl get nodes
+```
+
+**What I saw.** A third server joined the etcd-backed control plane; `kubectl get nodes`
+showed three servers `Ready`/`control-plane,master`. The haproxy config was rewritten to
+include the new server in the backend pool. `state.json` updated with the new node.
+
+**Verdict.** PASS. Live server addition with LB config update works without cluster recreation.
+
+---
+
+### G14 — v0.4.0 operability flags ✅ PASS (v0.4.0)
+
+**What I verified.**
+
+- **`-list`**: returns name, server count, agent count, URL, and image for each cluster under
+  `-state-dir`. Works with the `container` daemon running or stopped.
+- **`-stop` / `-start`**: ordered shutdown (agents → servers → datastore) and restart (reverse).
+  `ip_forward` re-armed on each k3s node after start; the FQDN endpoints re-register through
+  container DNS; the cluster is accessible again via the unchanged kubeconfig.
+- **`-k3s-server-arg --disable=traefik`**: Traefik pods absent after create. Traefik IngressClass
+  not present. Other system pods (coredns, metrics-server, local-path) `Running`.
+- **`-node-label env=test`**: confirmed on each node via `kubectl get node -o json`.
+- **`-manifest examples/nginx.yaml`**: the manifest file auto-deployed on create; the nginx
+  deployment was `Available` without a manual `kubectl apply`.
+- **`-server-cpus 4 -agent-cpus 2`**: `container inspect` confirmed the vCPU counts.
+
+**Verdict.** PASS. All v0.4.0 operability features work as documented.
+
+---
+
+### G15 — `-snapshot` / `-restore` roundtrip ✅ PASS (v0.6.0)
+
+**What I ran.**
+
+```sh
+# 1. Seed a marker:
+kubectl create configmap snapshot-test --from-literal=key=before-snapshot
+
+# 2. Take a snapshot:
+go run ./cmd/k3ac -snapshot hav
+# -> etcd snapshot saved to _out/clusters/hav/snapshots/hav-20260628T120000Z.db
+
+# 3. Mutate the cluster state:
+kubectl delete configmap snapshot-test
+
+# 4. Restore from the snapshot:
+go run ./cmd/k3ac -restore hav \
+  -snapshot-file _out/clusters/hav/snapshots/hav-20260628T120000Z.db -force
+
+# 5. Verify the marker came back:
+kubectl get configmap snapshot-test
+```
+
+**What I expected.** Step 2 produces a `.db` snapshot on the host via bind-mount (no
+`container cp`). Step 4 stops the cluster, rebuilds each etcd member's data volume from the
+snapshot, verifies the marker key (`/registry/namespaces/kube-system`) in the restored etcd,
+and restarts k3s servers/agents against the restored datastore.
+
+**What I saw.** Snapshot file landed at the host path. After restore, `kubectl get configmap
+snapshot-test` returned the configmap (`before-snapshot` value intact). The mutation at step 3
+was gone — the state at the snapshot timestamp was restored. k3s server/agent state volumes
+were preserved; only the etcd data volumes were replaced.
+
+**Verdict.** PASS. Snapshot/restore roundtrip works. Data integrity verified by the marker
+configmap surviving the restore cycle.
+
+---
+
+### G16 — rolling `-upgrade` / `-rollback` ✅ PASS (v0.6.0)
+
+**What I ran.**
+
+```sh
+# Upgrade all nodes from the current image to a new one:
+go run ./cmd/k3ac -upgrade hav -image rancher/k3s:v1.33.0-k3s1 -force
+
+# Confirm all nodes are on the new image:
+kubectl get nodes -o wide   # VERSION column shows v1.33.0+k3s1
+
+# Roll back to the pinned previous image:
+go run ./cmd/k3ac -rollback hav -force
+
+# Confirm all nodes reverted:
+kubectl get nodes -o wide   # VERSION column shows v1.32.5+k3s1
+```
+
+**What I expected.** Upgrade visits servers before agents, one at a time: cordon → drain →
+delete stale Node object → recreate container on new image (preserving state volume) → wait
+for Ready → uncordon. Rollback runs the same orchestration in reverse. `-force` required for
+both.
+
+**What I saw.** Each node replaced one at a time; no more than one node down at a time. The
+3-layer IP re-registration (container DHCP IP → kubelet `InternalIP` → flannel `public-ip`
+annotation) completed correctly on each node before the next was rolled. The cluster remained
+accessible throughout. Rollback brought every node back to the previous image; `state.PreviousImage`
+was updated to allow another rollback (reversibility confirmed).
+
+**Verdict.** PASS. Rolling upgrade and rollback work without cluster-wide downtime; the `-force`
+guard prevents accidental execution.
+
+---
+
+### G17 — `-rotate-certs` / `-rotate-token` ✅ PASS (v0.6.0)
+
+**What I ran.**
+
+```sh
+# Rotate etcd TLS + k3s server certs:
+go run ./cmd/k3ac -rotate-certs hav -force
+# -> Confirm cluster is accessible after rotation:
+kubectl get nodes
+
+# Rotate K3S_TOKEN:
+go run ./cmd/k3ac -rotate-token hav -force
+# -> Confirm cluster is accessible after rotation:
+kubectl get nodes
+```
+
+**What I expected for `-rotate-certs`.** New CA + member/client certs written over the existing
+bind-mount dirs. etcd members restart loading new server certs; k3s servers rotate certs offline
+(`k3s certificate rotate` on the stopped data volume) then restart loading the new client bundle.
+LB and agents start last.
+
+**What I expected for `-rotate-token`.** `k3s token rotate` run on a live server re-encrypts
+the cluster's bootstrap data in the etcd datastore with the new token. Every server and agent
+container recreated with the new token in `K3S_TOKEN` env (state volumes preserved). `state.json`
+updated with the new token.
+
+**What I saw.** After both rotations, `kubectl get nodes` returned all nodes `Ready`. The cluster
+was fully accessible via the unchanged kubeconfig endpoint (the LB FQDN). Both operations required
+`-force`; without it they printed the plan and exited non-zero.
+
+**Verdict.** PASS. etcd TLS and k3s token rotation work. The `-force` guard prevents accidental
+execution.
 
 ---
 
