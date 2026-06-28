@@ -165,9 +165,22 @@ func MergeKubeconfig(ctx context.Context, stateDir, clusterName string, logw io.
 		return fmt.Errorf("cleaning up temp cert files %q: %w", mergeDir, err)
 	}
 
-	fmt.Fprintf(logw, "merged cluster %q into ~/.kube/config and set the current context to %q\n", clusterName, clusterName)
+	fmt.Fprintf(logw, "merged cluster %q into %s and set the current context to %q\n", clusterName, kubeconfigTarget(), clusterName)
 
 	return nil
+}
+
+// kubeconfigTarget reports where kubectl actually writes the merged config so the success message
+// is accurate: the FIRST entry of $KUBECONFIG when set (kubectl writes to the first file in the
+// list), else the default ~/.kube/config.
+func kubeconfigTarget() string {
+	if kc := os.Getenv("KUBECONFIG"); kc != "" {
+		if first := strings.SplitN(kc, string(os.PathListSeparator), 2)[0]; first != "" {
+			return first
+		}
+	}
+
+	return "~/.kube/config"
 }
 
 // writeMergeCertFiles base64-decodes the CA / client cert / client key blobs and writes them as PEM

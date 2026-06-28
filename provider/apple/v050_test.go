@@ -473,6 +473,33 @@ users:
 
 // TestParseKubeconfigCreds extracts the server URL and three base64 cert blobs; a kubeconfig
 // missing any required field is rejected (BVA: complete vs missing).
+// TestKubeconfigTarget covers the success-message target resolution (BVA on $KUBECONFIG): unset
+// → default, a single path, and a multi-path list where kubectl writes to the FIRST entry.
+func TestKubeconfigTarget(t *testing.T) {
+	sep := string(os.PathListSeparator)
+
+	t.Run("unset keeps default", func(t *testing.T) {
+		t.Setenv("KUBECONFIG", "")
+		if got := kubeconfigTarget(); got != "~/.kube/config" {
+			t.Errorf("unset: got %q, want ~/.kube/config", got)
+		}
+	})
+
+	t.Run("single path", func(t *testing.T) {
+		t.Setenv("KUBECONFIG", "/tmp/kc.yaml")
+		if got := kubeconfigTarget(); got != "/tmp/kc.yaml" {
+			t.Errorf("single: got %q, want /tmp/kc.yaml", got)
+		}
+	})
+
+	t.Run("multi path uses first", func(t *testing.T) {
+		t.Setenv("KUBECONFIG", "/tmp/first.yaml"+sep+"/tmp/second.yaml")
+		if got := kubeconfigTarget(); got != "/tmp/first.yaml" {
+			t.Errorf("multi: got %q, want /tmp/first.yaml", got)
+		}
+	})
+}
+
 func TestParseKubeconfigCreds(t *testing.T) {
 	creds, err := parseKubeconfigCreds([]byte(sampleKubeconfig))
 	if err != nil {
