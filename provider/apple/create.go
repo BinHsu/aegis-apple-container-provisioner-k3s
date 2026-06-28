@@ -72,10 +72,10 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		}
 	}
 
-	// Managed datastore (HA): provision a Postgres micro-VM and wire its --datastore-endpoint
-	// BEFORE any server launches. A bring-your-own DatastoreEndpoint skips this. Extracted to
-	// setupDatastore to keep Create readable.
-	datastoreInfo, endpoint, err := p.setupDatastore(ctx, cfg, logw)
+	// Managed datastore (HA): provision the etcd cluster and wire its --datastore-endpoint BEFORE
+	// any server launches. A bring-your-own DatastoreEndpoint skips this. Returns one NodeInfo per
+	// etcd member. Extracted to setupDatastore to keep Create readable.
+	datastoreInfos, endpoint, err := p.setupDatastore(ctx, cfg, logw)
 	if err != nil {
 		return ClusterState{}, err
 	}
@@ -180,11 +180,11 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		nodes = append(nodes, info)
 	}
 
-	// Record the managed datastore node (if any) FIRST in state, so teardown and reporting
-	// see it. It is not a k3s node — it carries no kubeconfig and joins no cluster — but it
-	// is real infrastructure to reclaim, so it rides ClusterState.Nodes with RoleDatastore.
-	if datastoreInfo != nil {
-		nodes = append([]NodeInfo{*datastoreInfo}, nodes...)
+	// Record the managed datastore (etcd) members FIRST in state, so teardown and reporting see
+	// them. They are not k3s nodes — they carry no kubeconfig and join no k3s cluster — but they
+	// are real infrastructure to reclaim, so they ride ClusterState.Nodes with RoleDatastore.
+	if len(datastoreInfos) > 0 {
+		nodes = append(append([]NodeInfo{}, datastoreInfos...), nodes...)
 	}
 
 	// Everyday-correctness guard carried over from the Talos sibling: every node must
@@ -309,12 +309,14 @@ func (p *provisioner) launchJoinServers(ctx context.Context, cfg ClusterConfig, 
 	return infos, nil
 }
 
-// setupDatastore provisions the managed Postgres datastore when one is requested, returning its
-// NodeInfo and the endpoint the servers should use. When no managed datastore is needed (single
-// server, or a bring-your-own endpoint already set) it returns (nil, cfg.DatastoreEndpoint, nil).
-// A managed datastore requires a DNS domain: the servers reach it by FQDN, which is what lets the
-// control plane survive the cold-restart IP shift that killed embedded etcd (docs/ADR/0002).
-func (p *provisioner) setupDatastore(ctx context.Context, cfg ClusterConfig, logw io.Writer) (*NodeInfo, string, error) {
+// setupDatastore provisions the managed etcd cluster when one is requested, returning one NodeInfo
+// per member and the --datastore-endpoint the servers should use. When no managed datastore is
+// needed (single server, or a bring-your-own endpoint already set) it returns
+// (nil, cfg.DatastoreEndpoint, nil). A managed datastore requires a DNS domain: every member and
+// every server reaches the others by FQDN, which is what lets the control plane survive the
+// cold-restart IP shift (docs/ADR-0003 — name-bound etcd membership, unlike the IP-bound embedded
+// etcd ADR-0002 rejected).
+func (p *provisioner) setupDatastore(ctx context.Context, cfg ClusterConfig, logw io.Writer) ([]NodeInfo, string, error) {
 	if !cfg.ManageDatastore || cfg.DatastoreEndpoint != "" {
 		return nil, cfg.DatastoreEndpoint, nil
 	}
@@ -324,65 +326,82 @@ func (p *provisioner) setupDatastore(ctx context.Context, cfg ClusterConfig, log
 			"endpoint; set -dns-domain (and run: sudo container system dns create <domain>)", cfg.Name)
 	}
 
-	info, endpoint, err := p.provisionDatastore(ctx, cfg, logw)
-	if err != nil {
-		return nil, "", err
-	}
-
-	return &info, endpoint, nil
+	return p.provisionEtcdCluster(ctx, cfg, logw)
 }
 
-// provisionDatastore brings up the managed Postgres datastore micro-VM and returns its
-// NodeInfo plus the k3s --datastore-endpoint URL the servers should use. The data dir is a
-// named volume (labeled for the destroy sweep) with the PGDATA-subdir guard; readiness is a
-// host-side TCP dial to :5432 (Postgres opens that port only after initdb finishes). The
-// caller must have ensured p.dnsDomain != "" (the endpoint is FQDN-addressed so it survives
-// the cold-restart IP shift — docs/ADR/0002).
-func (p *provisioner) provisionDatastore(ctx context.Context, cfg ClusterConfig, logw io.Writer) (NodeInfo, string, error) {
-	name := datastoreNodeName(cfg.Name)
-	id := nodeFQDN(name, p.dnsDomain)
-
-	fmt.Fprintln(logw, "provisioning managed Postgres datastore", id)
-
-	password, err := generateDatastorePassword()
-	if err != nil {
-		return NodeInfo{}, "", err
+// provisionEtcdCluster brings up the N-member etcd cluster and returns one NodeInfo per member
+// plus the comma-separated k3s --datastore-endpoint the servers should use. Member count defaults
+// to defaultEtcdMembers and must be odd ≥3 (validateEtcdMemberCount). Each member's data dir is a
+// named volume (labeled for the destroy sweep) with the lost+found-subdir guard.
+//
+// Ordering matters: ALL members are launched before readiness is asserted, because etcd forms its
+// initial quorum only once every peer in --initial-cluster is up. Readiness is a per-member
+// host-side TCP dial to the client port — it proves each etcd process bound its socket, not that
+// quorum formed (the k3s servers retry their datastore connection until quorum settles). We
+// deliberately do NOT add an immediate cross-member quorum assert: the in-VM resolver negative-
+// caches a peer's NXDOMAIN for ~30s right after startup, so a strict cross-node health probe here
+// would be flaky (ADR-0003 gotcha). The caller must have ensured p.dnsDomain != "".
+func (p *provisioner) provisionEtcdCluster(ctx context.Context, cfg ClusterConfig, logw io.Writer) ([]NodeInfo, string, error) {
+	count := cfg.DatastoreMembers
+	if count == 0 {
+		count = defaultEtcdMembers
 	}
 
-	// Stale-state guard, same discipline as prepareNodeVolumes: a leftover data volume from a
-	// prior run carries an old Postgres cluster; refuse rather than boot onto it.
-	vol := datastoreVolumeName(cfg.Name)
-
-	present, err := p.volumeExists(ctx, vol)
-	if err != nil {
-		return NodeInfo{}, "", fmt.Errorf("checking datastore volume %q: %w", vol, err)
+	if err := validateEtcdMemberCount(count); err != nil {
+		return nil, "", fmt.Errorf("cluster %q: %w", cfg.Name, err)
 	}
 
-	if present {
-		return NodeInfo{}, "", fmt.Errorf("datastore volume %q already exists (stale state from a prior run); "+
-			"run -destroy for this cluster first — refusing to reuse it", vol)
+	members := etcdMembers(cfg.Name, count)
+	initialCluster := etcdInitialCluster(cfg.Name, p.dnsDomain, count)
+
+	// Create every member's data volume first (with the stale-state guard), so a leftover volume
+	// from a prior run is caught before any container launches — same discipline as
+	// prepareNodeVolumes. etcd volumes use their own scheme (etcdVolumeName), not nodeVolumeName.
+	for _, m := range members {
+		vol := etcdVolumeName(m.Name)
+
+		present, err := p.volumeExists(ctx, vol)
+		if err != nil {
+			return nil, "", fmt.Errorf("checking etcd volume %q: %w", vol, err)
+		}
+
+		if present {
+			return nil, "", fmt.Errorf("etcd volume %q already exists (stale state from a prior run); "+
+				"run -destroy for this cluster first — refusing to reuse it", vol)
+		}
+
+		if err := p.volumeCreate(ctx, vol, volumeLabels(cfg.Name)...); err != nil {
+			return nil, "", fmt.Errorf("creating etcd volume %q: %w", vol, err)
+		}
 	}
 
-	if err := p.volumeCreate(ctx, vol, volumeLabels(cfg.Name)...); err != nil {
-		return NodeInfo{}, "", fmt.Errorf("creating datastore volume %q: %w", vol, err)
+	// Launch all members, then assert readiness — quorum needs every peer running first.
+	infos := make([]NodeInfo, 0, count)
+
+	for _, m := range members {
+		id := nodeFQDN(m.Name, p.dnsDomain)
+
+		fmt.Fprintln(logw, "provisioning etcd member", id)
+
+		if _, err := p.run(ctx, buildEtcdRunArgs(cfg, m, p.dnsDomain, initialCluster)...); err != nil {
+			return nil, "", fmt.Errorf("launching etcd member %q: %w", id, err)
+		}
+
+		addr, err := p.waitForIPv4(ctx, id)
+		if err != nil {
+			return nil, "", err
+		}
+
+		infos = append(infos, NodeInfo{ID: id, Name: m.Name, Role: RoleDatastore, IPs: []netip.Addr{addr}})
 	}
 
-	if _, err := p.run(ctx, buildDatastoreRunArgs(cfg, password, p.dnsDomain)...); err != nil {
-		return NodeInfo{}, "", fmt.Errorf("launching datastore %q: %w", id, err)
+	for _, info := range infos {
+		if err := p.waitForEtcdMember(ctx, info.IPs[0]); err != nil {
+			return nil, "", fmt.Errorf("etcd member %q readiness: %w", info.ID, err)
+		}
 	}
 
-	addr, err := p.waitForIPv4(ctx, id)
-	if err != nil {
-		return NodeInfo{}, "", err
-	}
-
-	if err := p.waitForDatastore(ctx, addr); err != nil {
-		return NodeInfo{}, "", fmt.Errorf("datastore %q readiness: %w", id, err)
-	}
-
-	info := NodeInfo{ID: id, Name: name, Role: RoleDatastore, IPs: []netip.Addr{addr}}
-
-	return info, datastoreEndpointURL(cfg.Name, p.dnsDomain, password), nil
+	return infos, etcdDatastoreEndpoint(cfg.Name, p.dnsDomain, count), nil
 }
 
 // setupAPILB provisions the API load balancer when one is requested, returning its NodeInfo.
@@ -468,17 +487,18 @@ func writeAPILBConfig(clusterDir, config string) (string, error) {
 	return dir, nil
 }
 
-// datastoreReadyTimeout bounds the wait for Postgres to accept TCP connections. The official
-// image runs initdb (and any init scripts) before it opens :5432 to the network, so a
-// successful dial is a sound readiness signal.
-const datastoreReadyTimeout = 120 * time.Second
+// etcdReadyTimeout bounds the wait for an etcd member to bind its client port. etcd opens
+// listen-client-urls early in startup, so a successful dial is a sound "the process is up"
+// signal — it does NOT prove quorum (the k3s servers retry their datastore connection until
+// quorum settles; see provisionEtcdCluster).
+const etcdReadyTimeout = 120 * time.Second
 
-// waitForDatastore polls a plain TCP connect against <ip>:5432 until Postgres answers or the
-// timeout elapses. Unlike waitForAPIServer this is a bare TCP dial (no TLS): the readiness
-// signal is only that the port is open. The k3s servers do their own datastore auth afterward.
-func (p *provisioner) waitForDatastore(ctx context.Context, ip netip.Addr) error {
-	addr := net.JoinHostPort(ip.String(), strconv.Itoa(datastorePort))
-	deadline := time.Now().Add(datastoreReadyTimeout)
+// waitForEtcdMember polls a plain TCP connect against <ip>:2379 until the etcd member answers or
+// the timeout elapses. Unlike waitForAPIServer this is a bare TCP dial (no TLS): the readiness
+// signal is only that the client port is open. The k3s servers do their own etcd handshake after.
+func (p *provisioner) waitForEtcdMember(ctx context.Context, ip netip.Addr) error {
+	addr := net.JoinHostPort(ip.String(), strconv.Itoa(etcdClientPort))
+	deadline := time.Now().Add(etcdReadyTimeout)
 	dialer := &net.Dialer{Timeout: apiDialTimeout}
 
 	var lastErr error
@@ -491,7 +511,7 @@ func (p *provisioner) waitForDatastore(ctx context.Context, ip netip.Addr) error
 		lastErr = err
 
 		if time.Now().After(deadline) {
-			return fmt.Errorf("datastore at %s not reachable within %s: %w", addr, datastoreReadyTimeout, lastErr)
+			return fmt.Errorf("etcd member at %s not reachable within %s: %w", addr, etcdReadyTimeout, lastErr)
 		}
 
 		select {
@@ -658,9 +678,18 @@ func validateClusterConfig(cfg ClusterConfig) error {
 			cfg.Name, len(cfg.Nodes))
 	case servers > 1 && cfg.DatastoreEndpoint == "" && !cfg.ManageDatastore:
 		return fmt.Errorf("cluster %q: %d servers require an external datastore "+
-			"(-datastore-endpoint, or let k3ac provision one); multi-server sqlite is impossible "+
-			"and embedded etcd is intentionally disabled (see docs/ADR/0002)",
+			"(-datastore-endpoint, or let k3ac provision a managed etcd cluster); multi-server sqlite "+
+			"is impossible and embedded etcd is intentionally disabled (see docs/ADR/0002, docs/ADR-0003)",
 			cfg.Name, servers)
+	}
+
+	// Managed etcd: when an explicit member count is supplied, it must be odd and ≥3. 0 is left
+	// to default (defaultEtcdMembers) in provisionEtcdCluster, so it is not rejected here. Skipped
+	// for the bring-your-own path (the operator owns their datastore's topology).
+	if cfg.ManageDatastore && cfg.DatastoreEndpoint == "" && cfg.DatastoreMembers != 0 {
+		if err := validateEtcdMemberCount(cfg.DatastoreMembers); err != nil {
+			return fmt.Errorf("cluster %q: %w", cfg.Name, err)
+		}
 	}
 
 	return nil

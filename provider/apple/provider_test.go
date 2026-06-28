@@ -203,56 +203,177 @@ func TestBuildRunArgs_SingleServerNoDatastoreFlag(t *testing.T) {
 	}
 }
 
-// TestBuildDatastoreRunArgs locks the managed Postgres datastore recipe (Phase B / G9):
-// correct image, POSTGRES_* env, the PGDATA subdir guard (ext4 named volume ships a
-// lost+found), the data named volume, the cluster labels (so the destroy sweep reclaims it),
-// the FQDN --name — and crucially NONE of the k3s recipe (no --cap-add ALL, no tmpfs, no k3s
-// subcommand; the image is the final arg).
-func TestBuildDatastoreRunArgs(t *testing.T) {
+// TestValidateEtcdMemberCount is the BVA (CLAUDE.md k) on the etcd quorum invariant — the pure
+// odd-and-≥3 boundary. Members below 3 cannot tolerate a single loss; even counts gain no fault
+// tolerance and risk a split vote. Boundaries: 1=reject, 2=reject, 3=accept, 4=reject, 5=accept
+// (plus 0 below 3 and 6 even, for completeness around B=3).
+func TestValidateEtcdMemberCount(t *testing.T) {
+	tests := []struct {
+		n       int
+		wantErr bool
+	}{
+		{0, true},  // below minimum
+		{1, true},  // B-2: below minimum (and odd, but < 3)
+		{2, true},  // B-1: even and below minimum
+		{3, false}, // B: smallest valid quorum
+		{4, true},  // B+1: even
+		{5, false}, // next valid odd
+		{6, true},  // even
+	}
+
+	for _, tt := range tests {
+		err := validateEtcdMemberCount(tt.n)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("validateEtcdMemberCount(%d): wantErr=%v, got err=%v", tt.n, tt.wantErr, err)
+		}
+	}
+}
+
+// TestEtcdInitialClusterAndEndpoint locks the two FQDN string constructions for N members — the
+// single source of truth shared by buildEtcdRunArgs (--initial-cluster) and the k3s servers
+// (--datastore-endpoint). BVA on member count: B=3 (the default/minimum) and B+2=5.
+func TestEtcdInitialClusterAndEndpoint(t *testing.T) {
+	// 3 members: each member-name keyed to its FQDN peer URL, comma-joined, in order.
+	wantInitial3 := "aegis-etcd-1=http://aegis-etcd-1.aegis:2380," +
+		"aegis-etcd-2=http://aegis-etcd-2.aegis:2380," +
+		"aegis-etcd-3=http://aegis-etcd-3.aegis:2380"
+	if got := etcdInitialCluster("aegis", "aegis", 3); got != wantInitial3 {
+		t.Errorf("etcdInitialCluster(3):\n got %q\nwant %q", got, wantInitial3)
+	}
+
+	wantEndpoint3 := "http://aegis-etcd-1.aegis:2379," +
+		"http://aegis-etcd-2.aegis:2379," +
+		"http://aegis-etcd-3.aegis:2379"
+	if got := etcdDatastoreEndpoint("aegis", "aegis", 3); got != wantEndpoint3 {
+		t.Errorf("etcdDatastoreEndpoint(3):\n got %q\nwant %q", got, wantEndpoint3)
+	}
+
+	// 5 members: exactly five comma-separated client URLs (one per member).
+	if got := strings.Count(etcdDatastoreEndpoint("aegis", "aegis", 5), "http://"); got != 5 {
+		t.Errorf("etcdDatastoreEndpoint(5): got %d client URLs, want 5", got)
+	}
+
+	if got := strings.Count(etcdInitialCluster("aegis", "aegis", 5), "=http://"); got != 5 {
+		t.Errorf("etcdInitialCluster(5): got %d member entries, want 5", got)
+	}
+}
+
+// TestEtcdHelpers locks the etcd member naming + per-member volume derivation, the single source
+// of truth shared by buildEtcdRunArgs (create) and destroyRecordedNodes (teardown).
+func TestEtcdHelpers(t *testing.T) {
+	if got := etcdNodeName("aegis", 2); got != "aegis-etcd-2" {
+		t.Errorf("etcdNodeName: got %q, want aegis-etcd-2", got)
+	}
+
+	// Per-member volume — keyed on the member name so each of the N members gets its own.
+	if got := etcdVolumeName("aegis-etcd-2"); got != "aegis-etcd-2-data" {
+		t.Errorf("etcdVolumeName: got %q, want aegis-etcd-2-data", got)
+	}
+
+	members := etcdMembers("aegis", 3)
+	if len(members) != 3 {
+		t.Fatalf("etcdMembers(3): got %d members, want 3", len(members))
+	}
+
+	for i, m := range members {
+		if m.Role != RoleDatastore {
+			t.Errorf("member %d: role %v, want RoleDatastore", i, m.Role)
+		}
+
+		if want := fmt.Sprintf("aegis-etcd-%d", i+1); m.Name != want {
+			t.Errorf("member %d: name %q, want %q", i, m.Name, want)
+		}
+	}
+}
+
+// TestBuildEtcdRunArgs locks the etcd member recipe (ADR-0003): the CONTAINER --name is the FQDN
+// (so container DNS registers the peer — MANDATORY, a bare name leaves peers at NXDOMAIN and
+// quorum never forms), the etcd MEMBER --name is the bare name keyed in --initial-cluster, the
+// data dir is a SUBDIR of the mounted volume (lost+found guard), all peer/client URLs are FQDNs,
+// the cluster labels are present (destroy sweep), and crucially NONE of the k3s recipe (no
+// --cap-add ALL, no tmpfs, no k3s subcommand; the image precedes the etcd flags).
+func TestBuildEtcdRunArgs(t *testing.T) {
 	cfg := recipeCfg()
-	args := buildDatastoreRunArgs(cfg, "s3cr3t", "aegis")
+	member := NodeConfig{Name: "aegis-etcd-1", Role: RoleDatastore, Memory: defaultEtcdMemoryBytes}
+	initial := etcdInitialCluster("aegis", "aegis", 3)
+
+	args := buildEtcdRunArgs(cfg, member, "aegis", initial)
 	joined := strings.Join(args, " ")
 
 	checks := []struct {
 		ok   bool
 		desc string
 	}{
-		{hasPair(args, "--name", "aegis-db.aegis"), "--name is the datastore FQDN"},
-		{hasPair(args, "--env", "POSTGRES_USER=kine"), "POSTGRES_USER=kine"},
-		{hasPair(args, "--env", "POSTGRES_PASSWORD=s3cr3t"), "POSTGRES_PASSWORD set from the generated password"},
-		{hasPair(args, "--env", "POSTGRES_DB=kine"), "POSTGRES_DB=kine"},
-		{hasPair(args, "--env", "PGDATA="+datastorePGDataDir), "PGDATA points at a subdir (lost+found guard, G9)"},
-		{hasPair(args, "--volume", datastoreVolumeName("aegis")+":"+datastoreDataMount), "Postgres data on the named volume"},
+		{hasPair(args, "--name", "aegis-etcd-1.aegis"), "CONTAINER --name is the member FQDN (container DNS registers it — MANDATORY)"},
+		{hasPair(args, "--name", "aegis-etcd-1"), "etcd MEMBER --name is the bare name (keyed in --initial-cluster)"},
+		{hasPair(args, "--volume", etcdVolumeName("aegis-etcd-1")+":"+etcdDataMount), "data on the per-member named volume at the mount root"},
+		{hasPair(args, "--data-dir", etcdDataDir), "--data-dir is a SUBDIR of the mount (ext4 lost+found guard)"},
+		{strings.HasPrefix(etcdDataDir, etcdDataMount+"/"), "data dir is strictly under the mount"},
+		{hasPair(args, "--initial-advertise-peer-urls", "http://aegis-etcd-1.aegis:2380"), "advertise peer URL is the FQDN (name-bound membership)"},
+		{hasPair(args, "--advertise-client-urls", "http://aegis-etcd-1.aegis:2379"), "advertise client URL is the FQDN"},
+		{hasPair(args, "--listen-peer-urls", "http://0.0.0.0:2380"), "listen peer URL binds all interfaces"},
+		{hasPair(args, "--listen-client-urls", "http://0.0.0.0:2379"), "listen client URL binds all interfaces"},
+		{hasPair(args, "--initial-cluster", initial), "--initial-cluster carries the full FQDN member list"},
+		{hasPair(args, "--initial-cluster-state", "new"), "--initial-cluster-state new"},
+		{hasPair(args, "--initial-cluster-token", "aegis-etcd"), "--initial-cluster-token isolates this cluster's quorum"},
 		{hasPair(args, "--label", "k3s.cluster.name=aegis"), "cluster label (destroy sweep reclaims it)"},
 		{hasPair(args, "--label", "k3s.role=datastore"), "role=datastore label"},
 		{hasPair(args, "--label", "k3s.owned=true"), "owned label"},
-		{!strings.Contains(joined, "--cap-add"), "NO --cap-add (postgres is not k3s)"},
+		{memoryUsesMB(args), "--memory uses the MB suffix (bare M rejected)"},
+		{!strings.Contains(joined, "--cap-add"), "NO --cap-add (etcd is not k3s)"},
 		{!tmpfsContains(args, "/run") && !tmpfsContains(args, "/tmp"), "NO tmpfs (not a k3s node)"},
-		{!strings.Contains(joined, "server") && !strings.Contains(joined, "agent"), "NO k3s subcommand"},
-		{args[len(args)-1] == defaultDatastoreImage, "image is the final arg (no trailing subcommand)"},
+		{!hasNamedDatastoreVolume(args), "NO k3s /var/lib/rancher/k3s datastore volume"},
+		{!strings.Contains(joined, "--cluster-init"), "NO --cluster-init (this is EXTERNAL etcd, not embedded)"},
+		{imageIndex(args, defaultEtcdImage) >= 0, "etcd image present"},
+		{imageIndex(args, defaultEtcdImage) < len(args)-1, "etcd flags follow the image (image is NOT the final arg)"},
 	}
 
 	for _, c := range checks {
 		if !c.ok {
-			t.Errorf("datastore recipe check failed: %s\nargs: %s", c.desc, joined)
+			t.Errorf("etcd recipe check failed: %s\nargs: %s", c.desc, joined)
 		}
 	}
 }
 
-// TestDatastoreHelpers locks the datastore naming + endpoint derivation, the single source of
-// truth shared by buildDatastoreRunArgs (create) and destroyRecordedNodes (teardown).
-func TestDatastoreHelpers(t *testing.T) {
-	if got := datastoreNodeName("aegis"); got != "aegis-db" {
-		t.Errorf("datastoreNodeName: got %q, want aegis-db", got)
+// TestBuildEtcdRunArgs_Network verifies the optional --network flag is threaded through when set
+// (mirrors the k3s/LB recipes) and omitted when left empty (the built-in default).
+func TestBuildEtcdRunArgs_Network(t *testing.T) {
+	cfg := recipeCfg()
+	cfg.Network = "k3snet"
+	member := NodeConfig{Name: "aegis-etcd-1", Role: RoleDatastore, Memory: defaultEtcdMemoryBytes}
+
+	if !hasPair(buildEtcdRunArgs(cfg, member, "aegis", "x=y"), "--network", "k3snet") {
+		t.Error("custom network must be passed to the etcd container")
 	}
 
-	if got := datastoreVolumeName("aegis"); got != "aegis-db-pg" {
-		t.Errorf("datastoreVolumeName: got %q, want aegis-db-pg", got)
+	cfg.Network = ""
+	if slices.Contains(buildEtcdRunArgs(cfg, member, "aegis", "x=y"), "--network") {
+		t.Error("empty network must NOT emit --network")
 	}
+}
 
-	want := "postgres://kine:pw123@aegis-db.aegis:5432/kine?sslmode=disable"
-	if got := datastoreEndpointURL("aegis", "aegis", "pw123"); got != want {
-		t.Errorf("datastoreEndpointURL:\n got %q\nwant %q", got, want)
+// TestDestroyEtcdVolumeEnumeration proves the teardown derives the SAME per-member volume name
+// that create provisioned, for every etcd member — the create/destroy symmetry that guarantees a
+// destroy reclaims exactly the volumes create made (no orphans, no wrong target). It mirrors the
+// role-keyed branch in destroyRecordedNodes: RoleDatastore -> etcdVolumeName(node.Name).
+func TestDestroyEtcdVolumeEnumeration(t *testing.T) {
+	// A 3-member etcd cluster as Create would record it (RoleDatastore, member names).
+	members := etcdMembers("aegis", 3)
+
+	for _, m := range members {
+		node := NodeInfo{Name: m.Name, Role: RoleDatastore}
+
+		// Re-derive the volume the way destroyRecordedNodes does for a RoleDatastore node.
+		var vol string
+		if node.Role == RoleDatastore {
+			vol = etcdVolumeName(node.Name)
+		} else {
+			vol = nodeVolumeName("aegis", node.Name)
+		}
+
+		if want := m.Name + "-data"; vol != want {
+			t.Errorf("destroy would target %q for member %q, want %q (create/destroy symmetry)", vol, m.Name, want)
+		}
 	}
 }
 
@@ -985,4 +1106,10 @@ func subcommandIs(args []string, image, sub string) bool {
 	}
 
 	return false
+}
+
+// imageIndex returns the position of the image positional in args, or -1 if absent. Used to
+// assert the image's placement relative to trailing flags (etcd flags follow the image).
+func imageIndex(args []string, image string) int {
+	return slices.Index(args, image)
 }

@@ -22,6 +22,7 @@ func TestLoadFileConfig_ValidFile(t *testing.T) {
 		"network": "default",
 		"token": "secret",
 		"datastoreEndpoint": "postgres://kine:pw@db.aegis:5432/kine",
+		"datastoreMembers": 5,
 		"serverMemoryMB": 1536,
 		"agentMemoryMB": 1024,
 		"servers": 2,
@@ -79,6 +80,10 @@ func TestLoadFileConfig_ValidFile(t *testing.T) {
 		t.Errorf("DatastoreEndpoint: got %q", fc.DatastoreEndpoint)
 	}
 
+	if fc.DatastoreMembers != 5 {
+		t.Errorf("DatastoreMembers: got %d, want 5", fc.DatastoreMembers)
+	}
+
 	if fc.Servers != 2 {
 		t.Errorf("Servers: got %d, want 2", fc.Servers)
 	}
@@ -134,6 +139,33 @@ func TestLoadFileConfig_MissingFile(t *testing.T) {
 	}
 }
 
+// applyInputs bundles the pointer targets applyConfig writes into, so each test states
+// only the values it cares about and the call site stays readable after the signature grew
+// a datastore-members parameter. Defaults mirror the cmd/k3ac flag defaults.
+type applyInputs struct {
+	name, image, stateDir, network, dns, token, datastore string
+	serverMem, agentMem                                   int64
+	servers, agents, datastoreMembers                     int
+}
+
+func defaultApplyInputs() applyInputs {
+	return applyInputs{
+		name: "default-name", image: "", stateDir: "_out/clusters", network: "default",
+		dns: "aegis", token: "", datastore: "",
+		serverMem: 2048, agentMem: 2048,
+		servers: 1, agents: 1, datastoreMembers: 3,
+	}
+}
+
+// apply runs applyConfig against in's fields and returns the mutated copy.
+func apply(fc fileConfig, explicit map[string]bool, in applyInputs) applyInputs {
+	applyConfig(fc, explicit,
+		&in.name, &in.image, &in.stateDir, &in.network, &in.dns, &in.token, &in.datastore,
+		&in.serverMem, &in.agentMem, &in.servers, &in.agents, &in.datastoreMembers)
+
+	return in
+}
+
 // TestApplyConfig_FilePrecedence verifies the core merge rule: a value present in
 // the config file is applied when the matching flag was NOT set explicitly.
 // This covers the common "operator runs k3ac -config cluster.json" path.
@@ -146,6 +178,7 @@ func TestApplyConfig_FilePrecedence(t *testing.T) {
 		Network:           "custom",
 		Token:             "file-token",
 		DatastoreEndpoint: "postgres://kine:pw@db.aegis:5432/kine",
+		DatastoreMembers:  5,
 		ServerMemoryMB:    3072,
 		AgentMemoryMB:     2048,
 		Servers:           2,
@@ -153,64 +186,54 @@ func TestApplyConfig_FilePrecedence(t *testing.T) {
 		StateDir:          "file-state",
 	}
 
-	// No explicit flags — every field should be taken from the file.
-	name := "default-name"
-	image := ""
-	stateDir := "_out/clusters"
-	network := "default"
-	dns := "aegis"
-	token := ""
-	datastore := ""
-	serverMem := int64(2048)
-	agentMem := int64(2048)
-	servers := 1
-	agents := 1
+	got := apply(fc, map[string]bool{}, defaultApplyInputs())
 
-	applyConfig(fc, map[string]bool{},
-		&name, &image, &stateDir, &network, &dns, &token, &datastore, &serverMem, &agentMem, &servers, &agents)
-
-	if name != "from-file" {
-		t.Errorf("name: got %q, want %q", name, "from-file")
+	if got.name != "from-file" {
+		t.Errorf("name: got %q, want %q", got.name, "from-file")
 	}
 
-	if dns != "k3s" {
-		t.Errorf("dns: got %q, want %q", dns, "k3s")
+	if got.dns != "k3s" {
+		t.Errorf("dns: got %q, want %q", got.dns, "k3s")
 	}
 
-	if image != "rancher/k3s:v1.0.0" {
-		t.Errorf("image: got %q, want %q", image, "rancher/k3s:v1.0.0")
+	if got.image != "rancher/k3s:v1.0.0" {
+		t.Errorf("image: got %q, want %q", got.image, "rancher/k3s:v1.0.0")
 	}
 
-	if network != "custom" {
-		t.Errorf("network: got %q, want %q", network, "custom")
+	if got.network != "custom" {
+		t.Errorf("network: got %q, want %q", got.network, "custom")
 	}
 
-	if token != "file-token" {
-		t.Errorf("token: got %q, want %q", token, "file-token")
+	if got.token != "file-token" {
+		t.Errorf("token: got %q, want %q", got.token, "file-token")
 	}
 
-	if serverMem != 3072 {
-		t.Errorf("serverMemMB: got %d, want 3072", serverMem)
+	if got.serverMem != 3072 {
+		t.Errorf("serverMemMB: got %d, want 3072", got.serverMem)
 	}
 
-	if agentMem != 2048 {
-		t.Errorf("agentMemMB: got %d, want 2048", agentMem)
+	if got.agentMem != 2048 {
+		t.Errorf("agentMemMB: got %d, want 2048", got.agentMem)
 	}
 
-	if agents != 3 {
-		t.Errorf("agents: got %d, want 3", agents)
+	if got.agents != 3 {
+		t.Errorf("agents: got %d, want 3", got.agents)
 	}
 
-	if datastore != "postgres://kine:pw@db.aegis:5432/kine" {
-		t.Errorf("datastore: got %q", datastore)
+	if got.datastore != "postgres://kine:pw@db.aegis:5432/kine" {
+		t.Errorf("datastore: got %q", got.datastore)
 	}
 
-	if servers != 2 {
-		t.Errorf("servers: got %d, want 2", servers)
+	if got.datastoreMembers != 5 {
+		t.Errorf("datastoreMembers: got %d, want 5", got.datastoreMembers)
 	}
 
-	if stateDir != "file-state" {
-		t.Errorf("stateDir: got %q, want %q", stateDir, "file-state")
+	if got.servers != 2 {
+		t.Errorf("servers: got %d, want 2", got.servers)
+	}
+
+	if got.stateDir != "file-state" {
+		t.Errorf("stateDir: got %q, want %q", got.stateDir, "file-state")
 	}
 }
 
@@ -220,49 +243,45 @@ func TestApplyConfig_FilePrecedence(t *testing.T) {
 func TestApplyConfig_ExplicitFlagWins(t *testing.T) {
 	fileDomain := "file-domain"
 	fc := fileConfig{
-		Name:      "file-name",
-		DNSDomain: &fileDomain,
-		Image:     "rancher/k3s:v1.0.0",
-		Agents:    5,
+		Name:             "file-name",
+		DNSDomain:        &fileDomain,
+		Image:            "rancher/k3s:v1.0.0",
+		Agents:           5,
+		DatastoreMembers: 5,
 	}
 
-	// Simulate -name, -dns-domain, -image, -agents all set by the user.
+	// Simulate -name, -dns-domain, -image, -agents, -datastore-members all set by the user.
 	explicit := map[string]bool{
-		"name":       true,
-		"dns-domain": true,
-		"image":      true,
-		"agents":     true,
+		"name":              true,
+		"dns-domain":        true,
+		"image":             true,
+		"agents":            true,
+		"datastore-members": true,
 	}
 
-	name := "flag-name"
-	image := "rancher/k3s:v2.0.0"
-	stateDir := "_out"
-	network := "default"
-	dns := "flag-domain"
-	token := ""
-	datastore := ""
-	serverMem := int64(2048)
-	agentMem := int64(2048)
-	servers := 1
-	agents := 2
+	in := defaultApplyInputs()
+	in.name, in.image, in.dns, in.stateDir = "flag-name", "rancher/k3s:v2.0.0", "flag-domain", "_out"
+	in.agents, in.datastoreMembers = 2, 3
+	got := apply(fc, explicit, in)
 
-	applyConfig(fc, explicit,
-		&name, &image, &stateDir, &network, &dns, &token, &datastore, &serverMem, &agentMem, &servers, &agents)
-
-	if name != "flag-name" {
-		t.Errorf("name: explicit flag must win over file, got %q", name)
+	if got.name != "flag-name" {
+		t.Errorf("name: explicit flag must win over file, got %q", got.name)
 	}
 
-	if dns != "flag-domain" {
-		t.Errorf("dns-domain: explicit flag must win over file, got %q", dns)
+	if got.dns != "flag-domain" {
+		t.Errorf("dns-domain: explicit flag must win over file, got %q", got.dns)
 	}
 
-	if image != "rancher/k3s:v2.0.0" {
-		t.Errorf("image: explicit flag must win over file, got %q", image)
+	if got.image != "rancher/k3s:v2.0.0" {
+		t.Errorf("image: explicit flag must win over file, got %q", got.image)
 	}
 
-	if agents != 2 {
-		t.Errorf("agents: explicit flag must win over file, got %d", agents)
+	if got.agents != 2 {
+		t.Errorf("agents: explicit flag must win over file, got %d", got.agents)
+	}
+
+	if got.datastoreMembers != 3 {
+		t.Errorf("datastore-members: explicit flag must win over file, got %d", got.datastoreMembers)
 	}
 }
 
@@ -273,15 +292,10 @@ func TestApplyConfig_DNSDomainIPOnlyMode(t *testing.T) {
 	empty := ""
 	fc := fileConfig{DNSDomain: &empty}
 
-	dns := "aegis" // flag default
-	name, image, stateDir, network, token := "x", "", "_out", "default", ""
-	datastore, serverMem, agentMem, servers, agents := "", int64(2048), int64(2048), 1, 1
+	got := apply(fc, map[string]bool{}, defaultApplyInputs())
 
-	applyConfig(fc, map[string]bool{},
-		&name, &image, &stateDir, &network, &dns, &token, &datastore, &serverMem, &agentMem, &servers, &agents)
-
-	if dns != "" {
-		t.Errorf("IP-only mode: dns must be \"\", got %q", dns)
+	if got.dns != "" {
+		t.Errorf("IP-only mode: dns must be \"\", got %q", got.dns)
 	}
 }
 
@@ -290,15 +304,10 @@ func TestApplyConfig_DNSDomainIPOnlyMode(t *testing.T) {
 func TestApplyConfig_AbsentDNSDomainKeepsDefault(t *testing.T) {
 	fc := fileConfig{} // DNSDomain nil — key absent from file
 
-	dns := "aegis" // flag default
-	name, image, stateDir, network, token := "x", "", "_out", "default", ""
-	datastore, serverMem, agentMem, servers, agents := "", int64(2048), int64(2048), 1, 1
+	got := apply(fc, map[string]bool{}, defaultApplyInputs())
 
-	applyConfig(fc, map[string]bool{},
-		&name, &image, &stateDir, &network, &dns, &token, &datastore, &serverMem, &agentMem, &servers, &agents)
-
-	if dns != "aegis" {
-		t.Errorf("absent dnsDomain: default must be preserved, got %q", dns)
+	if got.dns != "aegis" {
+		t.Errorf("absent dnsDomain: default must be preserved, got %q", got.dns)
 	}
 }
 
@@ -310,18 +319,11 @@ func TestApplyConfig_AbsentDNSDomainKeepsDefault(t *testing.T) {
 func TestApplyConfig_AgentsZeroOverridesDefault(t *testing.T) {
 	fc := fileConfig{Agents: 0} // either "agents":0 in file or key absent
 
-	name, image, stateDir, network, dns, token := "x", "", "_out", "default", "aegis", ""
-	datastore := ""
-	serverMem, agentMem := int64(2048), int64(2048)
-	servers := 1
-	agents := 1 // flag default
-
-	applyConfig(fc, map[string]bool{},
-		&name, &image, &stateDir, &network, &dns, &token, &datastore, &serverMem, &agentMem, &servers, &agents)
+	got := apply(fc, map[string]bool{}, defaultApplyInputs())
 
 	// fc.Agents=0 must override the default (1) because -agents was not explicit.
-	if agents != 0 {
-		t.Errorf("agents from file (0) must override default (1) when -agents not explicit, got %d", agents)
+	if got.agents != 0 {
+		t.Errorf("agents from file (0) must override default (1) when -agents not explicit, got %d", got.agents)
 	}
 }
 
@@ -332,17 +334,10 @@ func TestApplyConfig_AgentsZeroOverridesDefault(t *testing.T) {
 func TestApplyConfig_ServersAbsentKeepsDefault(t *testing.T) {
 	fc := fileConfig{Servers: 0} // "servers" key absent → decoded as 0
 
-	name, image, stateDir, network, dns, token := "x", "", "_out", "default", "aegis", ""
-	datastore := ""
-	serverMem, agentMem := int64(2048), int64(2048)
-	servers := 1 // flag default
-	agents := 1
+	got := apply(fc, map[string]bool{}, defaultApplyInputs())
 
-	applyConfig(fc, map[string]bool{},
-		&name, &image, &stateDir, &network, &dns, &token, &datastore, &serverMem, &agentMem, &servers, &agents)
-
-	if servers != 1 {
-		t.Errorf("absent servers key must preserve default (1), got %d", servers)
+	if got.servers != 1 {
+		t.Errorf("absent servers key must preserve default (1), got %d", got.servers)
 	}
 }
 
@@ -351,16 +346,34 @@ func TestApplyConfig_ServersAbsentKeepsDefault(t *testing.T) {
 func TestApplyConfig_ServersFromFile(t *testing.T) {
 	fc := fileConfig{Servers: 3}
 
-	name, image, stateDir, network, dns, token := "x", "", "_out", "default", "aegis", ""
-	datastore := ""
-	serverMem, agentMem := int64(2048), int64(2048)
-	servers := 1 // flag default
-	agents := 1
+	got := apply(fc, map[string]bool{}, defaultApplyInputs())
 
-	applyConfig(fc, map[string]bool{},
-		&name, &image, &stateDir, &network, &dns, &token, &datastore, &serverMem, &agentMem, &servers, &agents)
+	if got.servers != 3 {
+		t.Errorf("servers from file (3) must override default (1), got %d", got.servers)
+	}
+}
 
-	if servers != 3 {
-		t.Errorf("servers from file (3) must override default (1), got %d", servers)
+// TestApplyConfig_DatastoreMembersAbsentKeepsDefault mirrors the Servers asymmetry for the
+// managed etcd cluster size: 0 is NOT a valid member count (must be odd >=3), so an absent
+// "datastoreMembers" key (decoded as 0) must NOT override the built-in default of 3.
+func TestApplyConfig_DatastoreMembersAbsentKeepsDefault(t *testing.T) {
+	fc := fileConfig{DatastoreMembers: 0} // key absent → decoded as 0
+
+	got := apply(fc, map[string]bool{}, defaultApplyInputs())
+
+	if got.datastoreMembers != 3 {
+		t.Errorf("absent datastoreMembers key must preserve default (3), got %d", got.datastoreMembers)
+	}
+}
+
+// TestApplyConfig_DatastoreMembersFromFile verifies an explicit "datastoreMembers": 5 in the
+// file is applied when -datastore-members was not set on the command line (HA-from-config).
+func TestApplyConfig_DatastoreMembersFromFile(t *testing.T) {
+	fc := fileConfig{DatastoreMembers: 5}
+
+	got := apply(fc, map[string]bool{}, defaultApplyInputs())
+
+	if got.datastoreMembers != 5 {
+		t.Errorf("datastoreMembers from file (5) must override default (3), got %d", got.datastoreMembers)
 	}
 }

@@ -82,17 +82,17 @@ func (p *provisioner) destroyRecordedNodes(ctx context.Context, state ClusterSta
 
 		// The API load balancer is stateless (its only config is the bind-mounted haproxy.cfg,
 		// regenerated each create), so there is no named volume to delete — stopping and
-		// removing the container above is the whole teardown. The managed datastore node uses
-		// its own volume scheme (<cluster>-db-pg), not the k3s nodeVolumeName scheme; every
-		// other (server/agent) node uses nodeVolumeName. Pick the right name by role so this
-		// pass deletes exactly the volume Create provisioned.
+		// removing the container above is the whole teardown. Each etcd member (RoleDatastore)
+		// uses its own per-member volume scheme (etcdVolumeName, keyed on the member NAME), not
+		// the k3s nodeVolumeName scheme; every server/agent node uses nodeVolumeName. Pick the
+		// right name by role so this pass deletes exactly the volume Create provisioned.
 		if node.Role == RoleLB {
 			continue
 		}
 
 		vol := nodeVolumeName(state.ClusterName, node.Name)
 		if node.Role == RoleDatastore {
-			vol = datastoreVolumeName(state.ClusterName)
+			vol = etcdVolumeName(node.Name)
 		}
 
 		if err := p.volumeDelete(ctx, vol); err != nil {
