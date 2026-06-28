@@ -93,6 +93,45 @@ func TestLoadFileConfig_ValidFile(t *testing.T) {
 	}
 }
 
+// TestLoadFileConfig_V040Fields verifies the v0.4.0 keys decode: per-node CPUs and the four
+// repeated lists (k3s server/agent args, node labels, manifests). DisallowUnknownFields means a
+// typo would fail loud, so a clean decode also proves the JSON tags match the documented names.
+func TestLoadFileConfig_V040Fields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v040.json")
+
+	content := `{
+		"name": "v040",
+		"serverCPUs": 4,
+		"agentCPUs": 1,
+		"k3sServerArgs": ["--disable=traefik", "--disable=servicelb"],
+		"k3sAgentArgs": ["--node-taint=role=worker:NoSchedule"],
+		"nodeLabels": ["tier=db", "zone=a"],
+		"manifests": ["./manifests/app.yaml"]
+	}`
+
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fc, err := loadFileConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if fc.ServerCPUs != 4 || fc.AgentCPUs != 1 {
+		t.Errorf("CPUs: got server=%d agent=%d, want 4/1", fc.ServerCPUs, fc.AgentCPUs)
+	}
+
+	if len(fc.K3sServerArgs) != 2 || fc.K3sServerArgs[0] != "--disable=traefik" {
+		t.Errorf("k3sServerArgs: got %v", fc.K3sServerArgs)
+	}
+
+	if len(fc.K3sAgentArgs) != 1 || len(fc.NodeLabels) != 2 || len(fc.Manifests) != 1 {
+		t.Errorf("lists: agentArgs=%v labels=%v manifests=%v", fc.K3sAgentArgs, fc.NodeLabels, fc.Manifests)
+	}
+}
+
 // TestLoadFileConfig_UnknownField verifies that DisallowUnknownFields causes an
 // unknown key to return a clear error rather than being silently ignored.
 // A typo like "serverMemoryMb" would otherwise produce a baffling "why is my
@@ -157,11 +196,24 @@ func defaultApplyInputs() applyInputs {
 	}
 }
 
-// apply runs applyConfig against in's fields and returns the mutated copy.
+// apply runs applyConfig against in's fields and returns the mutated copy. It builds a flagRefs
+// (the v0.4.0 struct form) from the applyInputs pointers, allocating throwaway storage for the
+// v0.4.0 fields (cpus / repeated lists) these precedence tests do not exercise; the dedicated
+// v0.4.0 tests below construct flagRefs directly so they can assert on the new fields.
 func apply(fc fileConfig, explicit map[string]bool, in applyInputs) applyInputs {
-	applyConfig(fc, explicit,
-		&in.name, &in.image, &in.stateDir, &in.network, &in.dns, &in.token, &in.datastore,
-		&in.serverMem, &in.agentMem, &in.servers, &in.agents, &in.datastoreMembers)
+	var serverCPUs, agentCPUs int
+	var serverArgs, agentArgs, nodeLabels, manifests stringList
+
+	applyConfig(fc, explicit, flagRefs{
+		clusterName: &in.name, image: &in.image, stateDir: &in.stateDir, network: &in.network,
+		dnsDomain: &in.dns, token: &in.token, datastore: &in.datastore,
+		serverMemMB: &in.serverMem, agentMemMB: &in.agentMem,
+		serverCount: &in.servers, agentCount: &in.agents,
+		datastoreMembers: &in.datastoreMembers,
+		serverCPUs:       &serverCPUs, agentCPUs: &agentCPUs,
+		serverArgs: &serverArgs, agentArgs: &agentArgs,
+		nodeLabels: &nodeLabels, manifests: &manifests,
+	})
 
 	return in
 }
@@ -376,4 +428,140 @@ func TestApplyConfig_DatastoreMembersFromFile(t *testing.T) {
 	if got.datastoreMembers != 5 {
 		t.Errorf("datastoreMembers from file (5) must override default (3), got %d", got.datastoreMembers)
 	}
+}
+
+// TestStringList_Repeated locks the repeated-flag accumulator: each Set appends one value, in
+// order, so -k3s-server-arg passed N times yields an N-element slice (BVA: zero / one / many).
+func TestStringList_Repeated(t *testing.T) {
+	var s stringList
+
+	if len(s) != 0 {
+		t.Fatalf("zero occurrences must be empty, got %v", s)
+	}
+
+	_ = s.Set("--disable=traefik")
+
+	if len(s) != 1 || s[0] != "--disable=traefik" {
+		t.Fatalf("one occurrence: got %v", s)
+	}
+
+	_ = s.Set("--disable=servicelb")
+	_ = s.Set("--node-label=tier=db")
+
+	want := []string{"--disable=traefik", "--disable=servicelb", "--node-label=tier=db"}
+	if len(s) != len(want) {
+		t.Fatalf("many occurrences: got %v want %v", s, want)
+	}
+
+	for i := range want {
+		if s[i] != want[i] {
+			t.Errorf("order not preserved at %d: got %q want %q", i, s[i], want[i])
+		}
+	}
+}
+
+// TestApplyConfig_CPUsFromFile is the BVA on the CPU fields: a non-zero file value overrides the
+// default when the flag is not explicit (override case); 0 in the file means "not specified" and
+// must leave the built-in default in place (default case, mirroring the memory fields).
+func TestApplyConfig_CPUsFromFile(t *testing.T) {
+	t.Run("non-zero file value overrides default", func(t *testing.T) {
+		fc := fileConfig{ServerCPUs: 4, AgentCPUs: 1}
+
+		serverCPUs, agentCPUs := 2, 2 // flag defaults
+		r := flagRefs{serverCPUs: &serverCPUs, agentCPUs: &agentCPUs, agentCount: new(int)}
+
+		applyConfig(fc, map[string]bool{}, r)
+
+		if serverCPUs != 4 {
+			t.Errorf("serverCPUs: got %d, want 4", serverCPUs)
+		}
+
+		if agentCPUs != 1 {
+			t.Errorf("agentCPUs: got %d, want 1", agentCPUs)
+		}
+	})
+
+	t.Run("zero file value keeps default (not specified)", func(t *testing.T) {
+		fc := fileConfig{} // ServerCPUs/AgentCPUs == 0
+
+		serverCPUs, agentCPUs := 2, 2 // flag defaults
+		r := flagRefs{serverCPUs: &serverCPUs, agentCPUs: &agentCPUs, agentCount: new(int)}
+
+		applyConfig(fc, map[string]bool{}, r)
+
+		if serverCPUs != 2 || agentCPUs != 2 {
+			t.Errorf("zero file CPUs must keep default 2/2, got %d/%d", serverCPUs, agentCPUs)
+		}
+	})
+
+	t.Run("explicit flag wins over file", func(t *testing.T) {
+		fc := fileConfig{ServerCPUs: 8}
+
+		serverCPUs := 6 // user passed -server-cpus 6
+		r := flagRefs{serverCPUs: &serverCPUs, agentCPUs: new(int), agentCount: new(int)}
+
+		applyConfig(fc, map[string]bool{"server-cpus": true}, r)
+
+		if serverCPUs != 6 {
+			t.Errorf("explicit -server-cpus must win over file, got %d", serverCPUs)
+		}
+	})
+}
+
+// TestApplyConfig_RepeatedListsFromFile locks the precedence for the repeated list fields
+// (k3s args / node labels / manifests): a non-empty file list is applied when the matching flag
+// was not given; an explicit flag (even with different values already present) suppresses the
+// file. BVA: empty list (not applied) vs non-empty list (applied).
+func TestApplyConfig_RepeatedListsFromFile(t *testing.T) {
+	t.Run("file lists applied when flags absent", func(t *testing.T) {
+		fc := fileConfig{
+			K3sServerArgs: []string{"--disable=traefik"},
+			K3sAgentArgs:  []string{"--node-taint=role=worker:NoSchedule"},
+			NodeLabels:    []string{"tier=db"},
+			Manifests:     []string{"/m/app.yaml"},
+		}
+
+		var serverArgs, agentArgs, nodeLabels, manifests stringList
+		r := flagRefs{
+			serverArgs: &serverArgs, agentArgs: &agentArgs,
+			nodeLabels: &nodeLabels, manifests: &manifests,
+			agentCount: new(int),
+		}
+
+		applyConfig(fc, map[string]bool{}, r)
+
+		if len(serverArgs) != 1 || serverArgs[0] != "--disable=traefik" {
+			t.Errorf("serverArgs from file: got %v", serverArgs)
+		}
+
+		if len(agentArgs) != 1 || len(nodeLabels) != 1 || len(manifests) != 1 {
+			t.Errorf("agent args / labels / manifests from file not applied: %v %v %v", agentArgs, nodeLabels, manifests)
+		}
+	})
+
+	t.Run("empty file list leaves flag value untouched", func(t *testing.T) {
+		fc := fileConfig{} // all lists nil/empty
+
+		serverArgs := stringList{"--from-flag"}
+		r := flagRefs{serverArgs: &serverArgs, agentArgs: new(stringList), nodeLabels: new(stringList), manifests: new(stringList), agentCount: new(int)}
+
+		applyConfig(fc, map[string]bool{}, r)
+
+		if len(serverArgs) != 1 || serverArgs[0] != "--from-flag" {
+			t.Errorf("empty file list must not clobber existing flag value, got %v", serverArgs)
+		}
+	})
+
+	t.Run("explicit flag suppresses file list", func(t *testing.T) {
+		fc := fileConfig{K3sServerArgs: []string{"--from-file"}}
+
+		serverArgs := stringList{"--from-flag"}
+		r := flagRefs{serverArgs: &serverArgs, agentArgs: new(stringList), nodeLabels: new(stringList), manifests: new(stringList), agentCount: new(int)}
+
+		applyConfig(fc, map[string]bool{"k3s-server-arg": true}, r)
+
+		if len(serverArgs) != 1 || serverArgs[0] != "--from-flag" {
+			t.Errorf("explicit -k3s-server-arg must suppress the file list, got %v", serverArgs)
+		}
+	})
 }

@@ -48,10 +48,28 @@ func run() error {
 		datastoreMembers = flag.Int("datastore-members", 3, "managed etcd cluster size for the auto-provisioned HA "+
 			"datastore; MUST be odd and >=3 (3 or 5). Ignored with a bring-your-own -datastore-endpoint.")
 		agentCount = flag.Int("agents", 1, "number of agent (worker) nodes")
+		serverCPUs = flag.Int("server-cpus", 2, "vCPUs per server node")
+		agentCPUs  = flag.Int("agent-cpus", 2, "vCPUs per agent node")
 		destroy    = flag.Bool("destroy", false, "destroy the named cluster instead of creating it")
 		addAgents  = flag.Int("add-agents", 0, "add N agent nodes to an existing cluster")
 		removeNode = flag.String("remove-node", "", "remove a node (by name) from an existing cluster")
+		list       = flag.Bool("list", false, "list clusters found under -state-dir (name, server/agent counts, URL, image) and exit")
+		startName  = flag.String("start", "", "start every node of an existing cluster (datastore -> servers -> agents)")
+		stopName   = flag.String("stop", "", "stop every node of an existing cluster (agents -> servers -> datastore)")
+
+		// Repeated flags (pass each more than once). k3s-arg passthrough opens the closed box:
+		// the verbatim args land after every built-in k3s flag, so they can disable traefik,
+		// change the CNI/flannel backend, set --cluster-cidr, enable ServiceLB, etc.
+		serverArgs stringList
+		agentArgs  stringList
+		nodeLabels stringList
+		manifests  stringList
 	)
+
+	flag.Var(&serverArgs, "k3s-server-arg", "extra k3s flag appended verbatim to every server (repeatable), e.g. --disable=traefik")
+	flag.Var(&agentArgs, "k3s-agent-arg", "extra k3s flag appended verbatim to every agent (repeatable)")
+	flag.Var(&nodeLabels, "node-label", "k3s node label KEY=VALUE applied to every node at create (repeatable)")
+	flag.Var(&manifests, "manifest", "host-side manifest file auto-deployed via the bootstrap server (repeatable)")
 
 	flag.Parse()
 
@@ -67,9 +85,22 @@ func run() error {
 		explicit := make(map[string]bool)
 		flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 
-		applyConfig(fc, explicit,
-			clusterName, k3sImage, stateDir, network, dnsDomain,
-			token, datastore, serverMemMB, agentMemMB, serverCount, agentCount, datastoreMembers)
+		applyConfig(fc, explicit, flagRefs{
+			clusterName: clusterName, image: k3sImage, stateDir: stateDir, network: network,
+			dnsDomain: dnsDomain, token: token, datastore: datastore,
+			serverMemMB: serverMemMB, agentMemMB: agentMemMB,
+			serverCount: serverCount, agentCount: agentCount,
+			datastoreMembers: datastoreMembers,
+			serverCPUs:       serverCPUs, agentCPUs: agentCPUs,
+			serverArgs: &serverArgs, agentArgs: &agentArgs,
+			nodeLabels: &nodeLabels, manifests: &manifests,
+		})
+	}
+
+	// -list is pure file I/O over -state-dir (no `container` daemon needed), so handle it
+	// before constructing the provisioner and exit.
+	if *list {
+		return listClusters(*stateDir)
 	}
 
 	ctx := context.Background()
@@ -80,6 +111,29 @@ func run() error {
 	}
 
 	defer prov.Close() //nolint:errcheck
+
+	// Lifecycle ops on an existing cluster (start/stop) take precedence over create, like
+	// the membership ops below. -stop is checked before -start so a single invocation does
+	// exactly one thing if both are somehow set.
+	if *stopName != "" {
+		if err := prov.Stop(ctx, *stateDir, *stopName, log.Writer()); err != nil {
+			return fmt.Errorf("stopping cluster %q: %w", *stopName, err)
+		}
+
+		fmt.Printf("stopped cluster %q\n", *stopName)
+
+		return nil
+	}
+
+	if *startName != "" {
+		if err := prov.Start(ctx, *stateDir, *startName, log.Writer()); err != nil {
+			return fmt.Errorf("starting cluster %q: %w", *startName, err)
+		}
+
+		fmt.Printf("started cluster %q\n", *startName)
+
+		return nil
+	}
 
 	if *destroy {
 		// Tolerate a missing state.json: a Create that failed before saveState (e.g. the
@@ -119,8 +173,8 @@ func run() error {
 	}
 
 	if *addAgents > 0 {
-		// Same per-agent memory/CPU the create path uses (NanoCPUs 2e9 == 2 vCPU).
-		state, err := prov.AddAgents(ctx, *stateDir, *clusterName, *addAgents, *agentMemMB*mib, 2e9, log.Writer())
+		// Reuse the create-path per-agent memory + vCPU. NanoCPUs is vCPUs * 1e9.
+		state, err := prov.AddAgents(ctx, *stateDir, *clusterName, *addAgents, *agentMemMB*mib, vcpuToNano(*agentCPUs), log.Writer())
 		if err != nil {
 			return err
 		}
@@ -133,47 +187,24 @@ func run() error {
 	// Build the node set: N servers then N agents. One server (default) is embedded-sqlite
 	// single-server (v0.1.x). More than one server requires -datastore-endpoint; the
 	// launcher's validateClusterConfig enforces that and is the single source of truth.
-	var nodes []apple.NodeConfig
+	//
+	// v0.4.0 per-node tunables: -server-cpus / -agent-cpus set the vCPU count; -node-label is
+	// applied to every node; the verbatim k3s-arg passthrough is resolved per role (server args
+	// onto servers, agent args onto agents). Extracted to buildNodes to keep run readable.
+	nodes := buildNodes(nodeSpec{
+		clusterName: *clusterName,
+		serverCount: *serverCount, agentCount: *agentCount,
+		serverCPUs: *serverCPUs, agentCPUs: *agentCPUs,
+		serverMemMB: *serverMemMB, agentMemMB: *agentMemMB,
+		labels: nodeLabels, serverArgs: serverArgs, agentArgs: agentArgs,
+	})
 
-	for i := range *serverCount {
-		nodes = append(nodes, apple.NodeConfig{
-			Name:     fmt.Sprintf("%s-server-%d", *clusterName, i+1),
-			Role:     apple.RoleServer,
-			Memory:   *serverMemMB * mib,
-			NanoCPUs: 2e9,
-		})
-	}
-
-	for i := range *agentCount {
-		nodes = append(nodes, apple.NodeConfig{
-			Name:     fmt.Sprintf("%s-agent-%d", *clusterName, i+1),
-			Role:     apple.RoleAgent,
-			Memory:   *agentMemMB * mib,
-			NanoCPUs: 2e9,
-		})
-	}
-
-	cfg := apple.ClusterConfig{
-		Name:              *clusterName,
-		Image:             *k3sImage,
-		Network:           *network,
-		StateDir:          *stateDir,
-		Token:             *token,
-		DatastoreEndpoint: *datastore,
-		// Infer managed-datastore (one-command HA): more than one server and no bring-your-own
-		// endpoint means k3ac provisions a managed etcd cluster itself (docs/ADR-0003). With an
-		// explicit -datastore-endpoint the operator owns the datastore (BYO). The provider
-		// validates the rest (e.g. managed HA needs -dns-domain; member count must be odd >=3).
-		ManageDatastore:  *serverCount > 1 && *datastore == "",
-		DatastoreMembers: *datastoreMembers,
-		// Infer the API load balancer: more than one server gets a single front-door endpoint
-		// (<cluster>-api.<domain>) so the kubeconfig + agents target one FQDN that fans out across
-		// servers (docs/ADR/0002, v0.3.0). A single server IS the endpoint, so it gets no LB.
-		// setupAPILB further gates on -dns-domain (the LB is FQDN-addressed) and skips gracefully
-		// when absent. The -config JSON path feeds serverCount, so HA-from-config gets the LB too.
-		ProvisionAPILB: *serverCount > 1,
-		Nodes:          nodes,
-	}
+	cfg := buildClusterConfig(clusterConfigInputs{
+		name: *clusterName, image: *k3sImage, network: *network, stateDir: *stateDir,
+		token: *token, datastore: *datastore,
+		serverCount: *serverCount, datastoreMembers: *datastoreMembers,
+		manifests: manifests,
+	}, nodes)
 
 	state, err := prov.Create(ctx, cfg, log.Writer())
 	if err != nil {
@@ -181,6 +212,110 @@ func run() error {
 	}
 
 	reportProvisioned(state, *dnsDomain)
+
+	return nil
+}
+
+// clusterConfigInputs are the create-time scalars buildClusterConfig folds into an
+// apple.ClusterConfig, grouped into a struct (same readability reasoning as nodeSpec/flagRefs)
+// so run stays short.
+type clusterConfigInputs struct {
+	name, image, network, stateDir, token, datastore string
+	serverCount, datastoreMembers                    int
+	manifests                                        []string
+}
+
+// buildClusterConfig assembles the provider ClusterConfig from the resolved flags and node set.
+// ManageDatastore and ProvisionAPILB are INFERRED from server count (more than one server, no
+// bring-your-own datastore) — k3ac provisions a managed etcd cluster (docs/ADR-0003) behind a
+// single API-LB front door (<cluster>-api.<domain>, docs/ADR/0002, v0.3.0). With an explicit
+// -datastore-endpoint the operator owns the datastore (BYO). The provider validates the rest
+// (managed HA needs -dns-domain; etcd member count must be odd >=3; setupAPILB skips the LB
+// gracefully without a DNS domain). The -config JSON path feeds serverCount, so HA-from-config
+// gets both the managed datastore and the LB.
+func buildClusterConfig(in clusterConfigInputs, nodes []apple.NodeConfig) apple.ClusterConfig {
+	return apple.ClusterConfig{
+		Name:              in.name,
+		Image:             in.image,
+		Network:           in.network,
+		StateDir:          in.stateDir,
+		Token:             in.token,
+		DatastoreEndpoint: in.datastore,
+		ManageDatastore:   in.serverCount > 1 && in.datastore == "",
+		DatastoreMembers:  in.datastoreMembers,
+		ProvisionAPILB:    in.serverCount > 1,
+		Manifests:         in.manifests,
+		Nodes:             nodes,
+	}
+}
+
+// nodeSpec is the create-time node-set request, grouped into a struct so buildNodes takes one
+// parameter instead of a ten-argument positional list (the same readability/footgun reasoning
+// as flagRefs).
+type nodeSpec struct {
+	clusterName             string
+	serverCount, agentCount int
+	serverCPUs, agentCPUs   int
+	serverMemMB, agentMemMB int64
+	labels                  []string
+	serverArgs, agentArgs   []string
+}
+
+// buildNodes assembles the create-time node set: serverCount servers then agentCount agents,
+// each with its per-role memory, vCPU, node labels, and verbatim k3s args (v0.4.0). Extracted
+// from run so the create path stays within the funlen budget and is independently testable.
+func buildNodes(s nodeSpec) []apple.NodeConfig {
+	var nodes []apple.NodeConfig
+
+	for i := range s.serverCount {
+		nodes = append(nodes, apple.NodeConfig{
+			Name:      fmt.Sprintf("%s-server-%d", s.clusterName, i+1),
+			Role:      apple.RoleServer,
+			Memory:    s.serverMemMB * mib,
+			NanoCPUs:  vcpuToNano(s.serverCPUs),
+			Labels:    s.labels,
+			ExtraArgs: s.serverArgs,
+		})
+	}
+
+	for i := range s.agentCount {
+		nodes = append(nodes, apple.NodeConfig{
+			Name:      fmt.Sprintf("%s-agent-%d", s.clusterName, i+1),
+			Role:      apple.RoleAgent,
+			Memory:    s.agentMemMB * mib,
+			NanoCPUs:  vcpuToNano(s.agentCPUs),
+			Labels:    s.labels,
+			ExtraArgs: s.agentArgs,
+		})
+	}
+
+	return nodes
+}
+
+// vcpuToNano converts a whole-vCPU count to the nano-CPU unit NodeConfig.NanoCPUs uses
+// (1 vCPU == 1e9 nano-CPUs). buildRunArgs divides back down to whole CPUs for `--cpus`.
+func vcpuToNano(vcpus int) int64 { return int64(vcpus) * 1e9 }
+
+// listClusters prints the -list table: one row per cluster found under stateDir, derived
+// purely from each cluster's state.json. The empty case is reported plainly rather than as an
+// error — no clusters is a valid state (e.g. before the first create).
+func listClusters(stateDir string) error {
+	clusters, err := apple.ListClusters(stateDir)
+	if err != nil {
+		return err
+	}
+
+	if len(clusters) == 0 {
+		fmt.Printf("no clusters found under %s\n", stateDir)
+
+		return nil
+	}
+
+	fmt.Printf("%-20s %7s %6s  %-40s %s\n", "NAME", "SERVERS", "AGENTS", "SERVER URL", "IMAGE")
+
+	for _, c := range clusters {
+		fmt.Printf("%-20s %7d %6d  %-40s %s\n", c.Name, c.Servers, c.Agents, c.ServerURL, c.Image)
+	}
 
 	return nil
 }
