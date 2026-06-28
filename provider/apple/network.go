@@ -14,9 +14,9 @@ const defaultNetwork = "default"
 // ensureNetwork creates the cluster network if it does not already exist. The built-in
 // "default" network is used as-is.
 //
-// UNVERIFIED ASSUMPTION: a custom --subnet network works for k3s the same way the Talos
-// sibling verified it did for Talos. The Talos G5 run confirmed vmnet honors --subnet;
-// not re-confirmed here for a k3s node.
+// Note: the custom-subnet path carries over the Talos G5 finding that vmnet honors
+// --subnet; not independently re-verified on k3s. The default network path (name == ""
+// or name == defaultNetwork) does not exercise this.
 func (p *provisioner) ensureNetwork(ctx context.Context, name, subnet string) error {
 	if name == "" || name == defaultNetwork {
 		return nil

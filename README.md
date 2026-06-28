@@ -16,6 +16,38 @@ A standalone launcher that boots k3s clusters as Apple Silicon micro-VMs via App
 > [`docs/ADR/0002-ha-via-external-datastore-not-embedded-etcd.md`](docs/ADR/0002-ha-via-external-datastore-not-embedded-etcd.md)
 > for the HA design.
 
+## Quickstart
+
+1. **Prerequisites:** macOS 26+, Apple Silicon, [`container`](https://github.com/apple/container) >= 1.0.0, Go 1.26+, kubectl (any recent version)
+2. **One-time DNS** (once per macOS boot — does not survive a reboot):
+   ```sh
+   sudo container system dns create aegis
+   ```
+3. **Create a cluster** (1 server + 1 agent, FQDN mode):
+   ```sh
+   go run ./cmd/k3ac -name aegis -agents 1
+   ```
+4. **Access:**
+   ```sh
+   export KUBECONFIG=_out/clusters/aegis/kubeconfig
+   kubectl get nodes
+   ```
+5. **HA control plane** (3 servers on a managed 3-node etcd cluster + 1 agent):
+   ```sh
+   go run ./cmd/k3ac -name hav -servers 3 -agents 1
+   ```
+   **Destroy** any cluster when done:
+   ```sh
+   go run ./cmd/k3ac -name aegis -destroy
+   ```
+
+## Requirements
+
+- macOS 26+, Apple Silicon
+- [`container`](https://github.com/apple/container) >= 1.0.0
+- Go 1.26+
+- kubectl (any recent version; required for `-merge-kubeconfig` and all cluster access)
+
 ## What it is (and isn't)
 
 - **Is:** a stdlib-only Go launcher that execs the `container` CLI to boot a k3s cluster as
@@ -127,6 +159,75 @@ and the API server cert covers that SAN. Adding or removing a server (via `-add-
 `-remove-node`) rewrites the haproxy config in place.
 
 **Scope:** managed HA requires `-dns-domain` (all components are reached by FQDN).
+
+## Architecture
+
+Single-node default runs sqlite embedded in the k3s server VM — no extra infrastructure.
+HA mode auto-provisions a 3-node etcd quorum and an haproxy API load balancer, then
+wires every server node to both (one `go run` command; see above).
+
+```
+aegis-apple-container-provisioner-k3s  (k3ac CLI)
+k3s on apple/container  (macOS 26+ · Apple Silicon)
+
+Single-node default: sqlite (k3s built-in) — no etcd or haproxy.
+HA mode (shown below): external etcd quorum + haproxy API LB.
+
+┌─────────────────────────────────────────────────────────────────┐
+│                macOS 26+  ·  Apple Silicon host                 │
+│                                                                 │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │      apple/container runtime  (vmnet · per-VM DHCP)       │  │
+│  │                                                           │  │
+│  │  ┌──────────── etcd quorum  (HA only) ─────────────────┐  │  │
+│  │  │  ┌───────────┐     ┌───────────┐     ┌───────────┐  │  │  │
+│  │  │  │hav-etcd-1 │◄───►│hav-etcd-2 │◄───►│hav-etcd-3 │  │  │  │
+│  │  │  │192.168.x.a│     │192.168.x.b│     │192.168.x.c│  │  │  │
+│  │  │  │ micro-VM  │     │ micro-VM  │     │ micro-VM  │  │  │  │
+│  │  │  └───────────┘     └───────────┘     └───────────┘  │  │  │
+│  │  │     external datastore — k3s pluggable backend      │  │  │
+│  │  └─────────────────────────────────────────────────────┘  │  │
+│  │                             │                             │  │
+│  │                             ▼                             │  │
+│  │  ┌──────────── haproxy API LB  (HA only) ──────────────┐  │  │
+│  │  │        hav-api  ·  192.168.x.d  ·  micro-VM         │  │  │
+│  │  │     load-balances kube-apiserver across servers     │  │  │
+│  │  └─────────────────────────────────────────────────────┘  │  │
+│  │                             │                             │  │
+│  │                             ▼                             │  │
+│  │  ┌──────────── k3s Server Nodes ───────────────────────┐  │  │
+│  │  │  ┌───────────┐  ┌───────────┐        ┌───────────┐  │  │  │
+│  │  │  │ k3s-srv-1 │  │ k3s-srv-2 │ . . .  │ k3s-srv-N │  │  │  │
+│  │  │  │192.168.x.e│  │192.168.x.f│        │    ...    │  │  │  │
+│  │  │  │ micro-VM  │  │ micro-VM  │        │ micro-VM  │  │  │  │
+│  │  │  └───────────┘  └───────────┘        └───────────┘  │  │  │
+│  │  └─────────────────────────────────────────────────────┘  │  │
+│  │                                                           │  │
+│  │  ┌──────────── k3s Agent Nodes  (workers) ─────────────┐  │  │
+│  │  │  ┌───────────┐  ┌───────────┐        ┌───────────┐  │  │  │
+│  │  │  │ worker-1  │  │ worker-2  │ . . .  │ worker-N  │  │  │  │
+│  │  │  │192.168.x.g│  │192.168.x.h│        │    ...    │  │  │  │
+│  │  │  │ micro-VM  │  │ micro-VM  │        │ micro-VM  │  │  │  │
+│  │  │  └───────────┘  └───────────┘        └───────────┘  │  │  │
+│  │  └─────────────────────────────────────────────────────┘  │  │
+│  │                                                           │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+Substrate is identical to the Talos lane:
+  · Each node = its own micro-VM on apple/container
+  · vmnet gives each node a separate DHCP-assigned IP
+
+HA datastore contrast (the lane differentiator):
+  ┌────────────────────────────┬─────────────────────────────┐
+  │  Talos lane                │  k3s lane (this project)    │
+  ├────────────────────────────┼─────────────────────────────┤
+  │  embedded etcd inside      │  external etcd quorum       │
+  │  control-plane nodes       │  (3 dedicated etcd VMs)     │
+  │  (no extra VMs needed)     │  + haproxy API LB VM        │
+  └────────────────────────────┴─────────────────────────────┘
+```
 
 ## Lifecycle
 
@@ -410,12 +511,6 @@ All green on Apple Silicon, `container` 1.0.0, `rancher/k3s:v1.32.5-k3s1` — se
 - **G9** — HA external-datastore: 2 servers survive a cold-restart DHCP IP shift (spike behind ADR-0002)
 - **G10** — HA end to end: managed 3-node etcd cluster + haproxy LB + multi-server; cold-restart survival; clean teardown
 - **G11+** — etcd mutual TLS, API LB bring-up, `-add-server`, v0.4.0 operability, and v0.6.0 day-2 ops (see VERIFICATION.md)
-
-## Requirements
-
-- macOS 26+, Apple Silicon
-- [`container`](https://github.com/apple/container) >= 1.0.0
-- Go 1.26+
 
 ## License
 
