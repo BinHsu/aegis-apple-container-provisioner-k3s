@@ -96,7 +96,7 @@ func TestEtcdctlHealthArgs(t *testing.T) {
 		{slices.Contains(args, "endpoint") && slices.Contains(args, "health"), "the 'endpoint health' verb is present"},
 		{hasPair(args, "--cacert", etcdTLSMount+"/"+etcdCACertFile), "CA from the member's TLS mount"},
 		{hasPair(args, "--cert", etcdTLSMount+"/"+etcdServerCertFile), "member server cert (mutual-TLS client)"},
-		{hasPair(args, "--key", etcdTLSMount+"/"+etcdServerKeyFile), "member server key"},
+		{hasPair(args, "--key", etcdTLSMount+"/"+etcdServerKeyFile), "member server key"}, //gitleaks:allow (etcdctl --key flag + a path constant, not a secret)
 		{hasPair(args, "--endpoints", "https://aegis-etcd-1.aegis:2379"), "the target endpoint"},
 		{!strings.Contains(joined, "http://"), "TLS only — no plaintext endpoint"},
 	}
