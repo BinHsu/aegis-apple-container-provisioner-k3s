@@ -202,7 +202,9 @@ func defaultApplyInputs() applyInputs {
 // v0.4.0 tests below construct flagRefs directly so they can assert on the new fields.
 func apply(fc fileConfig, explicit map[string]bool, in applyInputs) applyInputs {
 	var serverCPUs, agentCPUs int
-	var serverArgs, agentArgs, nodeLabels, manifests stringList
+	var serverArgs, agentArgs, nodeLabels, manifests, envVars stringList
+	var datastoreImage string
+	var datastoreMemMB int64
 
 	applyConfig(fc, explicit, flagRefs{
 		clusterName: &in.name, image: &in.image, stateDir: &in.stateDir, network: &in.network,
@@ -210,9 +212,10 @@ func apply(fc fileConfig, explicit map[string]bool, in applyInputs) applyInputs 
 		serverMemMB: &in.serverMem, agentMemMB: &in.agentMem,
 		serverCount: &in.servers, agentCount: &in.agents,
 		datastoreMembers: &in.datastoreMembers,
-		serverCPUs:       &serverCPUs, agentCPUs: &agentCPUs,
+		datastoreImage:   &datastoreImage, datastoreMemMB: &datastoreMemMB,
+		serverCPUs: &serverCPUs, agentCPUs: &agentCPUs,
 		serverArgs: &serverArgs, agentArgs: &agentArgs,
-		nodeLabels: &nodeLabels, manifests: &manifests,
+		nodeLabels: &nodeLabels, manifests: &manifests, envVars: &envVars,
 	})
 
 	return in
@@ -504,6 +507,91 @@ func TestApplyConfig_CPUsFromFile(t *testing.T) {
 
 		if serverCPUs != 6 {
 			t.Errorf("explicit -server-cpus must win over file, got %d", serverCPUs)
+		}
+	})
+}
+
+// TestLoadFileConfig_V050Fields verifies the v0.5.0 keys decode: managed datastore image/memory and
+// the -env list. DisallowUnknownFields means a clean decode also proves the JSON tags are correct.
+func TestLoadFileConfig_V050Fields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v050.json")
+
+	content := `{
+		"name": "v050",
+		"datastoreImage": "quay.io/coreos/etcd:v3.5.21",
+		"datastoreMemoryMB": 1024,
+		"envVars": ["HTTP_PROXY=http://proxy:3128", "NO_PROXY=.aegis"]
+	}`
+
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fc, err := loadFileConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if fc.DatastoreImage != "quay.io/coreos/etcd:v3.5.21" || fc.DatastoreMemoryMB != 1024 {
+		t.Errorf("datastore tuning: got image=%q mem=%d", fc.DatastoreImage, fc.DatastoreMemoryMB)
+	}
+
+	if len(fc.EnvVars) != 2 || fc.EnvVars[0] != "HTTP_PROXY=http://proxy:3128" {
+		t.Errorf("envVars: got %v", fc.EnvVars)
+	}
+}
+
+// TestApplyConfig_V050FromFile is the BVA on the v0.5.0 config-backed fields: a non-zero/non-empty
+// file value overrides the default when the flag is absent; the zero value (0 memory, empty image,
+// empty env list) leaves the default in place; an explicit flag suppresses the file value.
+func TestApplyConfig_V050FromFile(t *testing.T) {
+	t.Run("file values applied when flags absent", func(t *testing.T) {
+		fc := fileConfig{
+			DatastoreImage:    "quay.io/coreos/etcd:v3.5.21",
+			DatastoreMemoryMB: 1024,
+			EnvVars:           []string{"A=1"},
+		}
+
+		image := ""
+		var mem int64 = 512
+		var env stringList
+		r := flagRefs{datastoreImage: &image, datastoreMemMB: &mem, envVars: &env, agentCount: new(int)}
+
+		applyConfig(fc, map[string]bool{}, r)
+
+		if image != "quay.io/coreos/etcd:v3.5.21" || mem != 1024 || len(env) != 1 {
+			t.Errorf("file values not applied: image=%q mem=%d env=%v", image, mem, env)
+		}
+	})
+
+	t.Run("zero file values keep defaults", func(t *testing.T) {
+		fc := fileConfig{} // empty image, 0 memory, nil env
+
+		image := ""
+		var mem int64 = 512
+		var env stringList
+		r := flagRefs{datastoreImage: &image, datastoreMemMB: &mem, envVars: &env, agentCount: new(int)}
+
+		applyConfig(fc, map[string]bool{}, r)
+
+		if image != "" || mem != 512 || len(env) != 0 {
+			t.Errorf("zero file values must keep defaults: image=%q mem=%d env=%v", image, mem, env)
+		}
+	})
+
+	t.Run("explicit flags suppress the file", func(t *testing.T) {
+		fc := fileConfig{DatastoreImage: "from-file", DatastoreMemoryMB: 2048, EnvVars: []string{"FROM=file"}}
+
+		image := "from-flag"
+		var mem int64 = 256
+		env := stringList{"FROM=flag"}
+		r := flagRefs{datastoreImage: &image, datastoreMemMB: &mem, envVars: &env, agentCount: new(int)}
+
+		applyConfig(fc, map[string]bool{"datastore-image": true, "datastore-memory": true, "env": true}, r)
+
+		if image != "from-flag" || mem != 256 || len(env) != 1 || env[0] != "FROM=flag" {
+			t.Errorf("explicit flags must win: image=%q mem=%d env=%v", image, mem, env)
 		}
 	})
 }
