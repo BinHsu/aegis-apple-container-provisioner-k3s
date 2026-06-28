@@ -415,6 +415,33 @@ func TestStopStartOrder(t *testing.T) {
 		}
 	})
 
+	t.Run("full HA shape with API LB", func(t *testing.T) {
+		// RoleLB (v0.3.0) must slot AFTER servers and BEFORE agents on start — agents join through
+		// the LB FQDN, so it must be up before them; stop is the reverse (agents, LB, servers,
+		// datastore). REGRESSION: the v0.4.0 lifecycle predates RoleLB, so a catch-all default rank
+		// put the LB first on start, and Start then ran ip_forward on the haproxy node and aborted
+		// with EPERM (caught in v0.4.0 hardware bring-up).
+		nodes := []NodeInfo{
+			mk("aegis-agent-1", RoleAgent),
+			mk("aegis-api", RoleLB),
+			mk("aegis-etcd-1", RoleDatastore),
+			mk("aegis-server-1", RoleServer),
+			mk("aegis-server-2", RoleServer),
+		}
+
+		stop := names(stopOrder(nodes))
+		wantStop := []string{"aegis-agent-1", "aegis-api", "aegis-server-1", "aegis-server-2", "aegis-etcd-1"}
+		if !slices.Equal(stop, wantStop) {
+			t.Errorf("stop order:\n got %v\nwant %v", stop, wantStop)
+		}
+
+		start := names(startOrder(nodes))
+		wantStart := []string{"aegis-etcd-1", "aegis-server-1", "aegis-server-2", "aegis-api", "aegis-agent-1"}
+		if !slices.Equal(start, wantStart) {
+			t.Errorf("start order:\n got %v\nwant %v", start, wantStart)
+		}
+	})
+
 	t.Run("zero agents (server + datastore only)", func(t *testing.T) {
 		nodes := []NodeInfo{
 			mk("aegis-server-1", RoleServer),

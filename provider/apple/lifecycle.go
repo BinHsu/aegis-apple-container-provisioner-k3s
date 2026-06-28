@@ -16,29 +16,36 @@ import (
 // Ordering is the load-bearing part and is computed by two PURE functions (stopOrder /
 // startOrder) so it is unit-testable without the `container` CLI:
 //
-//   - STOP order:  agents first, then servers, then the datastore/LB last. Workers drain
-//     before the control plane; the datastore outlives every server that writes to it.
-//   - START order: the exact reverse — datastore first (the servers need it to be accepting
-//     connections), then servers, then agents.
+//   - STOP order:  agents first, then the LB, then servers, then the datastore last. Workers
+//     drain before the control plane; the datastore outlives every server that writes to it.
+//   - START order: the exact reverse — datastore first (the servers need it accepting
+//     connections), then servers, then the LB, then agents (which join through the LB FQDN, so
+//     it must be up before them).
 //
 // The vmnet substrate forces a per-node re-arm on start: a cold `container start` boots each
 // node onto a NEW DHCP IP, and there is no systemd to set net.ipv4.ip_forward=1, so Start
-// re-arms it per k3s node exactly as Create does (the datastore VM is not a k3s node and is
-// skipped). See docs/ADR/0002 for the IP-shift behaviour and the one-id-per-start constraint.
+// re-arms it per k3s node exactly as Create does. Only servers and agents are k3s nodes; the
+// datastore (etcd) and the LB (haproxy) are skipped (they neither need it nor can set it). See
+// docs/ADR/0002 for the IP-shift behaviour and the one-id-per-start constraint.
 
-// roleStopRank ranks a node's role for STOP ordering: lower stops first. Agents (workers)
-// drain before servers; the datastore stops last so it outlives every server still writing
-// to it. startOrder is the reverse of this ranking.
+// roleStopRank ranks a node's role for STOP ordering: lower stops first. Agents (workers) drain
+// first; the LB next (stateless, fronts the servers); then servers; the datastore stops last so
+// it outlives every server still writing to it. startOrder is the reverse, which puts the LB
+// AFTER the servers and BEFORE the agents — agents join through the LB FQDN, so it must be up
+// before them. (RoleLB and the multi-member etcd RoleDatastore arrived in v0.3.0, after the
+// v0.4.0 lifecycle was first written; this ranking integrates them.)
 func roleStopRank(r Role) int {
 	switch r {
 	case RoleAgent:
 		return 0
-	case RoleServer:
+	case RoleLB:
 		return 1
-	case RoleDatastore:
+	case RoleServer:
 		return 2
-	default:
+	case RoleDatastore:
 		return 3
+	default:
+		return 4
 	}
 }
 
@@ -123,8 +130,11 @@ func (p *provisioner) Start(ctx context.Context, stateDir, clusterName string, l
 			return fmt.Errorf("starting node %q: %w", node.Name, err)
 		}
 
-		// The datastore is not a k3s node — no ip_forward to re-arm.
-		if node.Role == RoleDatastore {
+		// Only k3s nodes (servers + agents) need ip_forward re-armed. The datastore (etcd) and the
+		// LB (haproxy) are NOT k3s nodes; their minimal images also can't set the sysctl (the
+		// haproxy:alpine container returns EPERM), so an allowlist here both skips needless work
+		// and avoids aborting Start on a non-k3s node.
+		if node.Role != RoleServer && node.Role != RoleAgent {
 			continue
 		}
 
