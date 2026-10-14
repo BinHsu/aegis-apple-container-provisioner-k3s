@@ -70,6 +70,7 @@ func run() error {
 		nodeLabels stringList
 		manifests  stringList
 		envVars    stringList
+		dnsServers stringList
 	)
 
 	flag.Var(&serverArgs, "k3s-server-arg", "extra k3s flag appended verbatim to every server (repeatable), e.g. --disable=traefik")
@@ -77,6 +78,8 @@ func run() error {
 	flag.Var(&nodeLabels, "node-label", "k3s node label KEY=VALUE applied to every node at create (repeatable)")
 	flag.Var(&manifests, "manifest", "host-side manifest file auto-deployed via the bootstrap server (repeatable)")
 	flag.Var(&envVars, "env", "environment variable KEY=VALUE injected into every k3s node (repeatable)")
+	flag.Var(&dnsServers, "dns", "DNS server IP for every node instead of the vmnet gateway (repeatable); cluster FQDNs then come from /etc/hosts")
+	caDir := flag.String("ca-dir", "", "absolute host dir holding ca-bundle.pem, trusted by every node for image pulls (TLS-interception proxies)")
 
 	// v0.6.0 day-2 operation flags, registered in a helper so run() stays within the funlen budget.
 	d2 := registerDay2Flags()
@@ -94,7 +97,7 @@ func run() error {
 			datastoreMembers: datastoreMembers, datastoreImage: datastoreImage, datastoreMemMB: datastoreMemMB,
 			serverCPUs: serverCPUs, agentCPUs: agentCPUs,
 			serverArgs: &serverArgs, agentArgs: &agentArgs,
-			nodeLabels: &nodeLabels, manifests: &manifests, envVars: &envVars,
+			nodeLabels: &nodeLabels, manifests: &manifests, envVars: &envVars, dnsServers: &dnsServers, caDir: caDir,
 		}); err != nil {
 			return err
 		}
@@ -206,7 +209,7 @@ func run() error {
 		token: *token, datastore: *datastore,
 		serverCount: *serverCount, datastoreMembers: *datastoreMembers,
 		datastoreImage: *datastoreImage, datastoreMemMB: *datastoreMemMB,
-		manifests: manifests, envVars: envVars,
+		manifests: manifests, envVars: envVars, dnsServers: dnsServers, caDir: *caDir,
 	}, nodeSpec{
 		clusterName: *clusterName,
 		serverCount: *serverCount, agentCount: *agentCount,
@@ -416,6 +419,8 @@ type clusterConfigInputs struct {
 	datastoreMemMB                                   int64
 	manifests                                        []string
 	envVars                                          []string
+	dnsServers                                       []string
+	caDir                                            string
 }
 
 // buildClusterConfig assembles the provider ClusterConfig from the resolved flags and node set.
@@ -440,6 +445,8 @@ func buildClusterConfig(in clusterConfigInputs, nodes []apple.NodeConfig) apple.
 		DatastoreMemoryBytes: in.datastoreMemMB * mib,
 		ProvisionAPILB:       in.serverCount > 1,
 		EnvVars:              in.envVars,
+		DNSServers:           in.dnsServers,
+		CADir:                in.caDir,
 		Manifests:            in.manifests,
 		Nodes:                nodes,
 	}

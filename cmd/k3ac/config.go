@@ -77,6 +77,9 @@ type fileConfig struct {
 	// EnvVars are KEY=VALUE environment variables injected into every k3s node (v0.5.0; -env).
 	// Empty/absent = none.
 	EnvVars []string `json:"envVars"`
+	// DNSServers are explicit node resolvers (v0.7.0; -dns). CADir holds ca-bundle.pem (v0.7.0; -ca-dir).
+	DNSServers []string `json:"dnsServers"`
+	CADir      string   `json:"caDir"`
 }
 
 // flagRefs bundles pointers to every flag variable applyConfig may overwrite. It replaces the
@@ -110,6 +113,9 @@ type flagRefs struct {
 	manifests      *stringList
 	// envVars is the -env KEY=VALUE list injected into every node (v0.5.0).
 	envVars *stringList
+	// dnsServers / caDir: v0.7.0 TLS-interception / silent-gateway-DNS support.
+	dnsServers *stringList
+	caDir      *string
 }
 
 // loadFileConfig reads a JSON cluster specification from path and decodes it into
@@ -229,6 +235,14 @@ func applyV050Config(fc fileConfig, explicit map[string]bool, r flagRefs) {
 
 	if !explicit["env"] && len(fc.EnvVars) > 0 {
 		*r.envVars = fc.EnvVars
+	}
+
+	if !explicit["dns"] && len(fc.DNSServers) > 0 && r.dnsServers != nil {
+		*r.dnsServers = fc.DNSServers
+	}
+
+	if !explicit["ca-dir"] && fc.CADir != "" && r.caDir != nil {
+		*r.caDir = fc.CADir
 	}
 }
 

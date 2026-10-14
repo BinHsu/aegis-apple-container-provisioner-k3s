@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -62,6 +63,10 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 	}
 
 	if err := validateClusterConfig(cfg); err != nil {
+		return ClusterState{}, err
+	}
+
+	if err := validateCADir(cfg.CADir); err != nil {
 		return ClusterState{}, err
 	}
 
@@ -219,6 +224,14 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 	// are real infrastructure to reclaim, so they ride ClusterState.Nodes with RoleDatastore.
 	if len(datastoreInfos) > 0 {
 		nodes = append(append([]NodeInfo{}, datastoreInfos...), nodes...)
+	}
+
+	// DNS override (v0.7.0): with explicit resolvers the nodes no longer see the host's
+	// /etc/resolver/<domain>, so serve the cluster's own FQDNs from each node's /etc/hosts.
+	if len(cfg.DNSServers) > 0 && p.dnsDomain != "" {
+		if err := p.writeClusterHosts(ctx, nodes, logw); err != nil {
+			return ClusterState{}, err
+		}
 	}
 
 	// Everyday-correctness guard carried over from the Talos sibling: every node must
@@ -635,7 +648,17 @@ func (p *provisioner) waitForEtcdMember(ctx context.Context, ip netip.Addr) erro
 
 // enableIPForward sets net.ipv4.ip_forward=1 inside a node. Mandatory for k3s pod
 // networking; the kiac spike proved it.
+//
+// apple/container 1.5.0 mounts /proc/sys read-only inside the guest (1.0.0 did not), so the
+// sysctl alone fails with "Read-only file system". Nodes run with --cap-add ALL, which lets us
+// remount /proc/sys read-write first; on runtimes where it is already writable the remount is a
+// no-op, so 1.0.0 behaviour is unchanged. The remount also unblocks the sysctls k3s itself
+// writes (kube-proxy, flannel) after this point.
 func (p *provisioner) enableIPForward(ctx context.Context, id string) error {
+	if _, err := p.exec(ctx, id, "mount", "-o", "remount,rw", "/proc/sys"); err != nil {
+		return fmt.Errorf("remounting /proc/sys read-write: %w", err)
+	}
+
 	if _, err := p.exec(ctx, id, "sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
 		return fmt.Errorf("enabling ip_forward: %w", err)
 	}
@@ -963,6 +986,49 @@ func assertDistinctIPs(nodes []NodeInfo) error {
 
 		seen[ip] = node.Name
 	}
+
+	return nil
+}
+
+// validateCADir checks the -ca-dir directory: absolute, and holding caBundleFile. Empty = unset.
+func validateCADir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+
+	if !filepath.IsAbs(dir) {
+		return fmt.Errorf("ca dir %q must be an absolute path", dir)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, caBundleFile)); err != nil {
+		return fmt.Errorf("ca dir %q: %w", dir, err)
+	}
+
+	return nil
+}
+
+// writeClusterHosts appends "<ip> <fqdn> <name>" for every node to every node's /etc/hosts
+// (v0.7.0, DNS-override mode only). Agents that started before this runs keep retrying the server
+// and succeed once the entry exists. Entries are written at create time; a cold restart that moves
+// DHCP IPs needs a re-create (or a later -start refresh) in this mode.
+func (p *provisioner) writeClusterHosts(ctx context.Context, nodes []NodeInfo, logw io.Writer) error {
+	var lines strings.Builder
+
+	for _, n := range nodes {
+		if len(n.IPs) == 0 {
+			continue
+		}
+
+		fmt.Fprintf(&lines, "%s %s %s\n", n.IPs[0], nodeFQDN(n.Name, p.dnsDomain), n.Name)
+	}
+
+	for _, n := range nodes {
+		if _, err := p.exec(ctx, n.ID, "sh", "-c", `printf '%s' "$1" >> /etc/hosts`, "sh", lines.String()); err != nil {
+			return fmt.Errorf("writing /etc/hosts on %q: %w", n.Name, err)
+		}
+	}
+
+	fmt.Fprintf(logw, "wrote %d cluster host entries into each node's /etc/hosts\n", len(nodes))
 
 	return nil
 }
