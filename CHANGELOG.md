@@ -14,6 +14,9 @@ All notable changes to k3ac are documented here. Format follows [Keep a Changelo
 - **Guest `/` was a private mount**, so pods using `mountPropagation` on a host path (e.g. the DataKit DaemonSet
   mounting `/`) failed with "path / is mounted on / but it is not a shared or slave mount". Every node now runs
   `mount --make-rshared /` in the same preparation step (create, start, add, rotate, restore).
+- **Pod-network TCP stalled on large responses** (pods stopped at ~450 KB of a 2.9 MB API response while
+  host-network pods got all of it; k3s's helm-install-traefik crash-looped with "http2: client connection lost").
+  Segmentation offload on the guest NIC was the trigger; nodes now run `ethtool -K eth0 tso off gso off`.
 
 ### Added
 
@@ -25,7 +28,8 @@ All notable changes to k3ac are documented here. Format follows [Keep a Changelo
   TLS-intercepting proxy.
 
 Verified 2026-10-14 on macOS 27.0.1, apple/container 1.5.0, rancher/k3s v1.32.5-k3s1, behind WARP: 1 server +
-1 agent Ready, all kube-system pods Running, cluster DNS / API / cross-node service reachable from a pod.
+1 agent Ready, all kube-system pods Running including Traefik, cluster DNS / API / cross-node service reachable
+from a pod, a 2.9 MB API response over the pod network, DataKit DaemonSet running and delivering data.
 Known limit: hosts entries are written at create; a cold restart that changes DHCP IPs needs a re-create.
 
 ---

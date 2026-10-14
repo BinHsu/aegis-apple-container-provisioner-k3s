@@ -667,6 +667,14 @@ func (p *provisioner) enableIPForward(ctx context.Context, id string) error {
 		return fmt.Errorf("making / rshared: %w", err)
 	}
 
+	// Pod-network TCP stalls on apple/container 1.5.0 (measured 2026-10-14): host-network pods pull a
+	// 2.9 MB API response in ~0.01 s, pod-network pods stop at ~450 KB and time out (helm-install-traefik
+	// then crash-loops with "http2: client connection lost"). Segmentation offload on the guest's
+	// virtio NIC is the trigger — TSO/GSO off fixes it, GRO does not matter. Idempotent.
+	if _, err := p.exec(ctx, id, "ethtool", "-K", "eth0", "tso", "off", "gso", "off"); err != nil {
+		return fmt.Errorf("disabling TSO/GSO on eth0: %w", err)
+	}
+
 	if _, err := p.exec(ctx, id, "sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
 		return fmt.Errorf("enabling ip_forward: %w", err)
 	}
