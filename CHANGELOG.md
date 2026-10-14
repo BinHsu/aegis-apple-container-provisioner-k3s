@@ -11,6 +11,9 @@ All notable changes to k3ac are documented here. Format follows [Keep a Changelo
 - **apple/container 1.5.0 mounts `/proc/sys` read-only** in the guest, so the ip_forward step failed with
   "Read-only file system". Nodes now `mount -o remount,rw /proc/sys` (they run with `--cap-add ALL`)
   before the sysctl; on runtimes where it is already writable the remount is a no-op.
+- **Guest `/` was a private mount**, so pods using `mountPropagation` on a host path (e.g. the DataKit DaemonSet
+  mounting `/`) failed with "path / is mounted on / but it is not a shared or slave mount". Every node now runs
+  `mount --make-rshared /` in the same preparation step (create, start, add, rotate, restore).
 
 ### Added
 

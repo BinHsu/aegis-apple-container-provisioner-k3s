@@ -659,6 +659,14 @@ func (p *provisioner) enableIPForward(ctx context.Context, id string) error {
 		return fmt.Errorf("remounting /proc/sys read-write: %w", err)
 	}
 
+	// The guest root is a private mount under apple/container, so any pod that bind-mounts a host
+	// path with mountPropagation (DaemonSets such as DataKit or node-exporter mounting "/") fails
+	// with `path "/" is mounted on "/" but it is not a shared or slave mount`. Make it rshared,
+	// as a systemd-booted Linux host would be. Idempotent.
+	if _, err := p.exec(ctx, id, "mount", "--make-rshared", "/"); err != nil {
+		return fmt.Errorf("making / rshared: %w", err)
+	}
+
 	if _, err := p.exec(ctx, id, "sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
 		return fmt.Errorf("enabling ip_forward: %w", err)
 	}
