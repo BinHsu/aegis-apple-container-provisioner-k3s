@@ -66,10 +66,6 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 		return ClusterState{}, err
 	}
 
-	if err := validateCADir(cfg.CADir); err != nil {
-		return ClusterState{}, err
-	}
-
 	// Generate a shared K3S_TOKEN if the caller did not supply one.
 	if cfg.Token == "" {
 		tok, err := generateToken()
@@ -228,10 +224,8 @@ func (p *provisioner) Create(ctx context.Context, cfg ClusterConfig, logw io.Wri
 
 	// DNS override (v0.7.0): with explicit resolvers the nodes no longer see the host's
 	// /etc/resolver/<domain>, so serve the cluster's own FQDNs from each node's /etc/hosts.
-	if len(cfg.DNSServers) > 0 && p.dnsDomain != "" {
-		if err := p.writeClusterHosts(ctx, nodes, logw); err != nil {
-			return ClusterState{}, err
-		}
+	if err := p.writeClusterHosts(ctx, cfg, nodes, logw); err != nil {
+		return ClusterState{}, err
 	}
 
 	// Everyday-correctness guard carried over from the Talos sibling: every node must
@@ -863,6 +857,10 @@ func splitRoles(nodes []NodeConfig) (servers, agents []NodeConfig) {
 // servers>=1 is valid. Both sides of B+1 (2 servers) are exercised: rejected without an
 // endpoint, accepted with one.
 func validateClusterConfig(cfg ClusterConfig) error {
+	if err := validateCADir(cfg.CADir); err != nil {
+		return err
+	}
+
 	servers := 0
 
 	for _, n := range cfg.Nodes {
@@ -1027,7 +1025,11 @@ func validateCADir(dir string) error {
 // (v0.7.0, DNS-override mode only). Agents that started before this runs keep retrying the server
 // and succeed once the entry exists. Entries are written at create time; a cold restart that moves
 // DHCP IPs needs a re-create (or a later -start refresh) in this mode.
-func (p *provisioner) writeClusterHosts(ctx context.Context, nodes []NodeInfo, logw io.Writer) error {
+func (p *provisioner) writeClusterHosts(ctx context.Context, cfg ClusterConfig, nodes []NodeInfo, logw io.Writer) error {
+	if len(cfg.DNSServers) == 0 || p.dnsDomain == "" {
+		return nil
+	}
+
 	var lines strings.Builder
 
 	for _, n := range nodes {
