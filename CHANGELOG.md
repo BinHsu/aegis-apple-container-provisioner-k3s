@@ -4,7 +4,7 @@ All notable changes to k3ac are documented here. Format follows [Keep a Changelo
 
 ---
 
-## [Unreleased] — apple/container 1.5.0 and TLS-interception networks
+## [v0.7.0] — apple/container 1.5.0 and TLS-interception networks
 
 ### Fixed
 
