@@ -4,6 +4,36 @@ All notable changes to k3ac are documented here. Format follows [Keep a Changelo
 
 ---
 
+## [v0.7.0] — apple/container 1.5.0 and TLS-interception networks
+
+### Fixed
+
+- **apple/container 1.5.0 mounts `/proc/sys` read-only** in the guest, so the ip_forward step failed with
+  "Read-only file system". Nodes now `mount -o remount,rw /proc/sys` (they run with `--cap-add ALL`)
+  before the sysctl; on runtimes where it is already writable the remount is a no-op.
+- **Guest `/` was a private mount**, so pods using `mountPropagation` on a host path (e.g. the DataKit DaemonSet
+  mounting `/`) failed with "path / is mounted on / but it is not a shared or slave mount". Every node now runs
+  `mount --make-rshared /` in the same preparation step (create, start, add, rotate, restore).
+- **Pod-network TCP stalled on large responses** (pods stopped at ~450 KB of a 2.9 MB API response while
+  host-network pods got all of it; k3s's helm-install-traefik crash-looped with "http2: client connection lost").
+  Segmentation offload on the guest NIC was the trigger; nodes now run `ethtool -K eth0 tso off gso off`.
+
+### Added
+
+- **`-dns <ip>`** (repeatable; JSON `dnsServers`): give every node explicit resolvers instead of the vmnet
+  gateway, which did not answer on a Mac under Cloudflare WARP. In this mode Create writes each node's
+  `<ip> <fqdn> <name>` into every node's `/etc/hosts` so cluster FQDNs still resolve.
+- **`-ca-dir <abs dir>`** (JSON `caDir`): bind-mounts a directory holding `ca-bundle.pem` read-only at
+  `/etc/k3ac/ca` and sets `SSL_CERT_FILE`, so the embedded containerd can pull images through a
+  TLS-intercepting proxy.
+
+Verified 2026-10-14 on macOS 27.0.1, apple/container 1.5.0, rancher/k3s v1.32.5-k3s1, behind WARP: 1 server +
+1 agent Ready, all kube-system pods Running including Traefik, cluster DNS / API / cross-node service reachable
+from a pod, a 2.9 MB API response over the pod network, DataKit DaemonSet running and delivering data.
+Known limit: hosts entries are written at create; a cold restart that changes DHCP IPs needs a re-create.
+
+---
+
 ## [v0.6.0] — day-2 operations
 
 ### Added

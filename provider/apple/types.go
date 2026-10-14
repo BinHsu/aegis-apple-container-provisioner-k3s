@@ -136,6 +136,17 @@ type ClusterConfig struct {
 	// built-in K3S_TOKEN / K3S_URL env and are create-time only (AddAgents/AddServer do not thread
 	// them). Empty = none. Mirrors the -k3s-server-arg stringList pattern.
 	EnvVars []string
+	// DNSServers, when non-empty, are passed to every node as `container run --dns <ip>`
+	// (-dns, repeatable; v0.7.0). For hosts where the vmnet gateway resolver does not answer
+	// (observed under Cloudflare WARP, 2026-10-14). Because the override bypasses the host's
+	// /etc/resolver/<domain>, Create then writes every node's "<ip> <fqdn>" into each node's
+	// /etc/hosts so the cluster's own FQDNs still resolve. Create-time only; empty = vmnet default.
+	DNSServers []string
+	// CADir, when non-empty, is an absolute host directory holding ca-bundle.pem (public CAs plus
+	// any TLS-interception CA). It is bind-mounted read-only into every node at caMount and
+	// SSL_CERT_FILE points k3s (and its embedded containerd) at the bundle, so image pulls work
+	// behind an intercepting proxy (-ca-dir; v0.7.0). Empty = the image's own trust store.
+	CADir string
 	// Manifests are host-side Kubernetes manifest file paths bind-mounted into the BOOTSTRAP
 	// server's k3s auto-deploy dir (/var/lib/rancher/k3s/server/manifests) so k3s applies them
 	// at startup (v0.4.0). Each file is mounted INDIVIDUALLY (not the whole directory) so k3s's

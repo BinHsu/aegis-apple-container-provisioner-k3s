@@ -79,7 +79,7 @@ func run() error {
 	flag.Var(&envVars, "env", "environment variable KEY=VALUE injected into every k3s node (repeatable)")
 
 	// v0.6.0 day-2 operation flags, registered in a helper so run() stays within the funlen budget.
-	d2 := registerDay2Flags()
+	d2, nf := registerDay2Flags(), registerNetworkFlags()
 
 	flag.Parse()
 
@@ -94,7 +94,7 @@ func run() error {
 			datastoreMembers: datastoreMembers, datastoreImage: datastoreImage, datastoreMemMB: datastoreMemMB,
 			serverCPUs: serverCPUs, agentCPUs: agentCPUs,
 			serverArgs: &serverArgs, agentArgs: &agentArgs,
-			nodeLabels: &nodeLabels, manifests: &manifests, envVars: &envVars,
+			nodeLabels: &nodeLabels, manifests: &manifests, envVars: &envVars, dnsServers: nf.dns, caDir: nf.caDir,
 		}); err != nil {
 			return err
 		}
@@ -206,7 +206,7 @@ func run() error {
 		token: *token, datastore: *datastore,
 		serverCount: *serverCount, datastoreMembers: *datastoreMembers,
 		datastoreImage: *datastoreImage, datastoreMemMB: *datastoreMemMB,
-		manifests: manifests, envVars: envVars,
+		manifests: manifests, envVars: envVars, dnsServers: *nf.dns, caDir: *nf.caDir,
 	}, nodeSpec{
 		clusterName: *clusterName,
 		serverCount: *serverCount, agentCount: *agentCount,
@@ -271,6 +271,24 @@ type day2FlagRefs struct {
 	snapshot, restore, snapshotFile             *string
 	upgrade, rollback, rotateCerts, rotateToken *string
 	force                                       *bool
+}
+
+// netFlagRefs are the v0.7.0 node-network flags for hosts behind TLS interception / a silent vmnet resolver.
+type netFlagRefs struct {
+	dns   *stringList
+	caDir *string
+}
+
+// registerNetworkFlags declares -dns (repeatable) and -ca-dir. Kept out of run so it stays within funlen.
+func registerNetworkFlags() netFlagRefs {
+	var dns stringList
+
+	flag.Var(&dns, "dns", "DNS server IP for every node instead of the vmnet gateway (repeatable); cluster FQDNs then come from /etc/hosts")
+
+	return netFlagRefs{
+		dns:   &dns,
+		caDir: flag.String("ca-dir", "", "absolute host dir holding ca-bundle.pem, trusted by every node for image pulls (TLS-interception proxies)"),
+	}
 }
 
 // registerDay2Flags declares the v0.6.0 day-2 operation flags and returns pointers to them. The
@@ -416,6 +434,8 @@ type clusterConfigInputs struct {
 	datastoreMemMB                                   int64
 	manifests                                        []string
 	envVars                                          []string
+	dnsServers                                       []string
+	caDir                                            string
 }
 
 // buildClusterConfig assembles the provider ClusterConfig from the resolved flags and node set.
@@ -440,6 +460,8 @@ func buildClusterConfig(in clusterConfigInputs, nodes []apple.NodeConfig) apple.
 		DatastoreMemoryBytes: in.datastoreMemMB * mib,
 		ProvisionAPILB:       in.serverCount > 1,
 		EnvVars:              in.envVars,
+		DNSServers:           in.dnsServers,
+		CADir:                in.caDir,
 		Manifests:            in.manifests,
 		Nodes:                nodes,
 	}

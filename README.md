@@ -2,7 +2,7 @@
 
 A standalone launcher that boots k3s clusters as Apple Silicon micro-VMs via Apple's [`container`](https://github.com/apple/container) tool — **NOT** a k3s upstream provider interface (k3s has none).
 
-> **Status: v0.6.0 — all hardware gates GREEN.** G1–G10 (v0.1.0–v0.2.0) plus additional v0.3.0–v0.6.0
+> **Status: v0.7.0 — runs on Apple `container` 1.5.0 (v0.6.0 and earlier: 1.0.0).** G1–G10 (v0.1.0–v0.2.0) plus additional v0.3.0–v0.6.0
 > gates verified on Apple Silicon with `container` 1.0.0 and `rancher/k3s:v1.32.5-k3s1`:
 > k3s boots under `vminitd`, multi-node `host-gw` networking, named-volume persistence,
 > host-side readiness + bind-mount kubeconfig delivery (no `container cp`), FQDN endpoint
@@ -41,10 +41,24 @@ A standalone launcher that boots k3s clusters as Apple Silicon micro-VMs via App
    go run ./cmd/k3ac -name aegis -destroy
    ```
 
+## Release notes — which Apple `container` each release targets
+
+| k3ac release | Apple `container` verified | k3s image | Notes |
+|---|---|---|---|
+| **v0.7.0** | **1.5.0** | `rancher/k3s:v1.32.5-k3s1` | Required for 1.5.0: `/proc/sys` remount, `/` rshared, TSO/GSO off on node NIC. New opt-in `-dns` / `-ca-dir` for TLS-interception networks (e.g. Cloudflare WARP). See CHANGELOG |
+| v0.6.0 | 1.0.0 | `rancher/k3s:v1.32.5-k3s1` | day-2 operations |
+| v0.5.0 | 1.0.0 | `rancher/k3s:v1.32.5-k3s1` | |
+| v0.4.0 | 1.0.0 | `rancher/k3s:v1.32.5-k3s1` | |
+| v0.3.0 | 1.0.0 | `rancher/k3s:v1.32.5-k3s1` | |
+| v0.2.0 | 1.0.0 | `rancher/k3s:v1.32.5-k3s1` | |
+
+Releases up to v0.6.0 do **not** start on Apple `container` 1.5.0 (the first node fails at
+`sysctl net.ipv4.ip_forward` with "Read-only file system"). Full per-release details: [`CHANGELOG.md`](CHANGELOG.md).
+
 ## Requirements
 
 - macOS 26+, Apple Silicon
-- [`container`](https://github.com/apple/container) >= 1.0.0
+- [`container`](https://github.com/apple/container) >= 1.0.0 (1.5.0 needs v0.7.0 or later — see Release notes)
 - Go 1.26+
 - kubectl (any recent version; required for `-merge-kubeconfig` and all cluster access)
 

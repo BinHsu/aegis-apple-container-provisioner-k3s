@@ -505,6 +505,13 @@ func nodeTmpfsPaths() []string {
 // kubeconfigHostDir, when non-empty (server node only), is bind-mounted at kubeconfigMount
 // so k3s can write its admin kubeconfig straight to the host. The caller passes the
 // absolute cluster state dir; agents pass "".
+// caMount is where -ca-dir's host directory appears inside each node (read-only); caBundleFile is
+// the bundle file name expected in it.
+const (
+	caMount      = "/etc/k3ac/ca"
+	caBundleFile = "ca-bundle.pem"
+)
+
 func buildRunArgs(cfg ClusterConfig, node NodeConfig, serverURL, dnsDomain, kubeconfigHostDir string) []string {
 	args := []string{
 		"run", "--detach",
@@ -590,6 +597,18 @@ func buildRunArgs(cfg ClusterConfig, node NodeConfig, serverURL, dnsDomain, kube
 	// --env flags on every k3s node, alongside the built-in K3S_TOKEN/K3S_URL. Empty = none.
 	for _, env := range cfg.EnvVars {
 		args = append(args, "--env", env)
+	}
+
+	// DNS OVERRIDE (v0.7.0): explicit resolvers instead of the vmnet gateway (see
+	// ClusterConfig.DNSServers). Cluster FQDNs are then served from /etc/hosts (Create).
+	for _, ip := range cfg.DNSServers {
+		args = append(args, "--dns", ip)
+	}
+
+	// CA BUNDLE (v0.7.0): trust an intercepting proxy's CA for image pulls (see ClusterConfig.CADir).
+	if cfg.CADir != "" {
+		args = append(args, "--volume", cfg.CADir+":"+caMount+":ro",
+			"--env", "SSL_CERT_FILE="+caMount+"/"+caBundleFile)
 	}
 
 	if cfg.Network != "" {
