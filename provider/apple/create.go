@@ -661,6 +661,13 @@ func (p *provisioner) enableIPForward(ctx context.Context, id string) error {
 		return fmt.Errorf("making / rshared: %w", err)
 	}
 
+	// eBPF agents (DataKit eBPF, OBI) need debugfs/tracefs/bpffs, which a systemd host mounts but
+	// the apple/container guest leaves as empty directories ("neither debugfs nor tracefs are
+	// mounted"). Mounted after the rshared step so pods see them. Idempotent. See ADR-0005.
+	if err := p.mountEBPFKernelFS(ctx, id); err != nil {
+		return err
+	}
+
 	// Pod-network TCP stalls on apple/container 1.5.0 (measured 2026-10-14): host-network pods pull a
 	// 2.9 MB API response in ~0.01 s, pod-network pods stop at ~450 KB and time out (helm-install-traefik
 	// then crash-loops with "http2: client connection lost"). Segmentation offload on the guest's

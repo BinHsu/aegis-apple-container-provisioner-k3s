@@ -45,7 +45,7 @@ A standalone launcher that boots k3s clusters as Apple Silicon micro-VMs via App
 
 | k3ac release | Apple `container` verified | k3s image | Notes |
 |---|---|---|---|
-| *unreleased (v0.8.0)* | 1.5.0 | `rancher/k3s:v1.32.5-k3s1` | Opt-in `-egress`: host-side `ac-egress` relay for hosts where vmnet NAT is dead (Cloudflare WARP connected). `-start` refreshes cluster `/etc/hosts`. See CHANGELOG |
+| *unreleased (v0.8.0)* | 1.5.0 | `rancher/k3s:v1.32.5-k3s1` | Opt-in `-egress`: host-side `ac-egress` relay for hosts where vmnet NAT is dead (Cloudflare WARP connected). `-start` refreshes cluster `/etc/hosts`. Nodes now mount debugfs / tracefs / bpffs (default, idempotent) for eBPF agents. See CHANGELOG |
 | **v0.7.0** | **1.5.0** | `rancher/k3s:v1.32.5-k3s1` | Required for 1.5.0: `/proc/sys` remount, `/` rshared, TSO/GSO off on node NIC. New opt-in `-dns` / `-ca-dir` for TLS-interception networks (e.g. Cloudflare WARP). See CHANGELOG |
 | v0.6.0 | 1.0.0 | `rancher/k3s:v1.32.5-k3s1` | day-2 operations |
 | v0.5.0 | 1.0.0 | `rancher/k3s:v1.32.5-k3s1` | |
@@ -258,6 +258,13 @@ validate → ensureNetwork → DNS domain precheck
   → launch each AGENT (K3S_URL=https://<cluster>-api.<domain>:6443 when HA, or server FQDN for single-server)
   → waitForIPv4 → exec sysctl → saveState
 ```
+
+**Node preparation** (the "exec sysctl" step above; also run by `-start`, `-add-agents`, `-add-server`, `-upgrade`/`-rollback`,
+`-rotate-*` and `-restore`): remount `/proc/sys` rw, make `/` rshared, mount debugfs on `/sys/kernel/debug`,
+tracefs on `/sys/kernel/tracing` and bpffs on `/sys/fs/bpf` when the kernel offers them and they are not
+already mounted (eBPF agents such as DataKit eBPF or OBI need them; see
+[ADR-0005](docs/ADR/0005-node-ebpf-pseudo-filesystems.md)), turn off TSO/GSO on `eth0`, set `ip_forward=1`.
+Every step is idempotent, and there is no flag: an existing cluster picks the mounts up on its next `-start`.
 
 Create **refuses to boot onto stale state**: if a node's named volume already exists
 from a prior run, it fails and tells you to destroy first.

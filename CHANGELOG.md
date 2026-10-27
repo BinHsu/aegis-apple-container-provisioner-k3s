@@ -18,6 +18,14 @@ All notable changes to k3ac are documented here. Format follows [Keep a Changelo
   state so later `-start`s re-enable it. `-stop` and `-destroy` stop the relay by its recorded pid (verified to
   be an `ac-egress` process first).
 
+- **Nodes mount debugfs, tracefs and bpffs** (`/sys/kernel/debug`, `/sys/kernel/tracing`, `/sys/fs/bpf`) in the
+  same preparation step as the v0.7.0 fixes (create, start, add, rotate, restore). Under apple/container
+  1.5.0 (guest kernel 6.18 arm64) these are empty directories, so eBPF agents failed — DataKit eBPF with
+  "neither debugfs nor tracefs are mounted". Default-on, no flag: only filesystems the kernel lists in
+  `/proc/filesystems` and that are not already in `/proc/mounts` are mounted, so a re-run is a no-op and a kernel
+  without one of them is skipped rather than failed. Existing clusters get the mounts on their next `-start`.
+  See docs/ADR/0005.
+
 ### Fixed
 
 - **Agents could not rejoin after a cold restart when cluster FQDNs come only from `/etc/hosts`** (`-dns`

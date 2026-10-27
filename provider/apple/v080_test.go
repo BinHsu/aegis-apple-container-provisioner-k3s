@@ -54,3 +54,57 @@ func TestClusterHostsBlock(t *testing.T) {
 		t.Fatal("every line must carry the marker so a refresh can remove it")
 	}
 }
+
+func TestMissingKernelFS(t *testing.T) {
+	filesystems := "nodev\tsysfs\nnodev\tproc\nnodev\tdebugfs\nnodev\ttracefs\nnodev\tbpf\n\text4\n"
+
+	// Fresh apple/container node: the targets are empty directories, nothing mounted.
+	fresh := "/dev/vda / ext4 rw,relatime 0 0\nsysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n"
+
+	got := missingKernelFS(fresh, filesystems, ebpfKernelFS)
+	if len(got) != 3 {
+		t.Fatalf("fresh node: want all 3 missing, got %v", got)
+	}
+
+	// Already prepared (second -start): nothing to do — the idempotence guarantee.
+	prepared := fresh +
+		"debugfs /sys/kernel/debug debugfs rw,relatime 0 0\n" +
+		"tracefs /sys/kernel/tracing tracefs rw,relatime 0 0\n" +
+		"bpf /sys/fs/bpf bpf rw,relatime 0 0\n"
+	if got := missingKernelFS(prepared, filesystems, ebpfKernelFS); len(got) != 0 {
+		t.Fatalf("prepared node: want none missing, got %v", got)
+	}
+
+	// Partial: only tracefs mounted (debugfs auto-mounting tracefs under debug/tracing must not count).
+	partial := fresh +
+		"tracefs /sys/kernel/tracing tracefs rw,relatime 0 0\n" +
+		"tracefs /sys/kernel/debug/tracing tracefs rw,relatime 0 0\n"
+	got = missingKernelFS(partial, filesystems, ebpfKernelFS)
+	if len(got) != 2 || got[0].FSType != "debugfs" || got[1].FSType != "bpf" {
+		t.Fatalf("partial node: got %v", got)
+	}
+
+	// Kernel without tracefs/bpf: skipped, never an attempted (failing) mount.
+	got = missingKernelFS(fresh, "nodev\tsysfs\nnodev\tdebugfs\n", ebpfKernelFS)
+	if len(got) != 1 || got[0].FSType != "debugfs" {
+		t.Fatalf("limited kernel: got %v", got)
+	}
+}
+
+func TestKernelFSMountArgs(t *testing.T) {
+	want := map[string]string{
+		"debugfs": "mount -t debugfs debugfs /sys/kernel/debug",
+		"tracefs": "mount -t tracefs tracefs /sys/kernel/tracing",
+		"bpf":     "mount -t bpf bpf /sys/fs/bpf",
+	}
+
+	if len(ebpfKernelFS) != len(want) {
+		t.Fatalf("ebpfKernelFS has %d entries, want %d", len(ebpfKernelFS), len(want))
+	}
+
+	for _, fs := range ebpfKernelFS {
+		if got := strings.Join(kernelFSMountArgs(fs), " "); got != want[fs.FSType] {
+			t.Errorf("%s: got %q want %q", fs.FSType, got, want[fs.FSType])
+		}
+	}
+}
