@@ -108,3 +108,32 @@ func TestKernelFSMountArgs(t *testing.T) {
 		}
 	}
 }
+
+func TestLegacyTracefsNeeded(t *testing.T) {
+	filesystems := "nodev\tdebugfs\nnodev\ttracefs\nnodev\tbpf\n"
+	base := "/dev/vda / ext4 rw 0 0\n"
+	debugfs := "debugfs /sys/kernel/debug debugfs rw,relatime 0 0\n"
+	tracefs := "tracefs /sys/kernel/tracing tracefs rw,relatime 0 0\n"
+
+	cases := []struct {
+		name, mounts, filesystems string
+		want                      bool
+	}{
+		{"debugfs mounted, legacy path empty", base + debugfs + tracefs, filesystems, true},
+		{"already mounted (idempotent re-run)", base + debugfs + tracefs +
+			"tracefs /sys/kernel/debug/tracing tracefs rw,relatime 0 0\n", filesystems, false},
+		{"debugfs not mounted", base + tracefs, filesystems, false},
+		{"something else on /sys/kernel/debug", base + "tmpfs /sys/kernel/debug tmpfs rw 0 0\n", filesystems, false},
+		{"kernel without tracefs", base + debugfs, "nodev\tdebugfs\n", false},
+	}
+
+	for _, c := range cases {
+		if got := legacyTracefsNeeded(c.mounts, c.filesystems); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+
+	if got := strings.Join(kernelFSMountArgs(legacyTracefs), " "); got != "mount -t tracefs tracefs /sys/kernel/debug/tracing" {
+		t.Errorf("legacy mount args: %q", got)
+	}
+}

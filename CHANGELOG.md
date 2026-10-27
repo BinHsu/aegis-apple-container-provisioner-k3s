@@ -24,7 +24,10 @@ All notable changes to k3ac are documented here. Format follows [Keep a Changelo
   "neither debugfs nor tracefs are mounted". Default-on, no flag: only filesystems the kernel lists in
   `/proc/filesystems` and that are not already in `/proc/mounts` are mounted, so a re-run is a no-op and a kernel
   without one of them is skipped rather than failed. Existing clusters get the mounts on their next `-start`.
-  See docs/ADR/0005.
+  tracefs is also mounted at the legacy `/sys/kernel/debug/tracing`: the guest kernel does not create it inside
+  debugfs, and DataKit's official DaemonSet hostPath-mounts only `/sys/kernel/debug`, so its netflow probe still
+  failed with tracefs on `/sys/kernel/tracing` alone. If the directory cannot be created there, k3ac warns and
+  continues. See docs/ADR/0005.
 
 ### Fixed
 

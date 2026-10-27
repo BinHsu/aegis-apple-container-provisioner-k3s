@@ -261,8 +261,9 @@ validate → ensureNetwork → DNS domain precheck
 
 **Node preparation** (the "exec sysctl" step above; also run by `-start`, `-add-agents`, `-add-server`, `-upgrade`/`-rollback`,
 `-rotate-*` and `-restore`): remount `/proc/sys` rw, make `/` rshared, mount debugfs on `/sys/kernel/debug`,
-tracefs on `/sys/kernel/tracing` and bpffs on `/sys/fs/bpf` when the kernel offers them and they are not
-already mounted (eBPF agents such as DataKit eBPF or OBI need them; see
+tracefs on `/sys/kernel/tracing` (and again at the legacy `/sys/kernel/debug/tracing`, because some agent manifests,
+such as DataKit's official DaemonSet, hostPath-mount only `/sys/kernel/debug`) and bpffs on `/sys/fs/bpf` when the
+kernel offers them and they are not already mounted (eBPF agents such as DataKit eBPF or OBI need them; see
 [ADR-0005](docs/ADR/0005-node-ebpf-pseudo-filesystems.md)), turn off TSO/GSO on `eth0`, set `ip_forward=1`.
 Every step is idempotent, and there is no flag: an existing cluster picks the mounts up on its next `-start`.
 

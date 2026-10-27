@@ -5,6 +5,7 @@ package apple
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -84,5 +85,57 @@ func (p *provisioner) mountEBPFKernelFS(ctx context.Context, id string) error {
 		}
 	}
 
+	// Legacy path, re-read because debugfs may have just been mounted above.
+	if mounts, err = p.exec(ctx, id, "cat", "/proc/mounts"); err != nil {
+		return fmt.Errorf("reading /proc/mounts: %w", err)
+	}
+
+	if !legacyTracefsNeeded(mounts, filesystems) {
+		return nil
+	}
+
+	// Newer kernels can be built without the tracefs automount inside debugfs, so the directory may
+	// be absent, and debugfs may refuse mkdir. That leaves the node no worse than before; warn, do
+	// not fail node preparation over it.
+	if _, err := p.exec(ctx, id, "mkdir", "-p", legacyTracefs.Target); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: node %s: cannot create %s, skipping legacy tracefs mount: %v\n",
+			id, legacyTracefs.Target, err)
+
+		return nil
+	}
+
+	if _, err := p.exec(ctx, id, kernelFSMountArgs(legacyTracefs)...); err != nil {
+		return fmt.Errorf("mounting tracefs on %s: %w", legacyTracefs.Target, err)
+	}
+
 	return nil
+}
+
+// legacyTracefs is tracefs at its pre-4.1 location inside debugfs. Agents whose manifests
+// hostPath-mount only /sys/kernel/debug (the official DataKit DaemonSet is one) look for tracefs
+// there and never see /sys/kernel/tracing.
+var legacyTracefs = kernelFS{FSType: "tracefs", Target: "/sys/kernel/debug/tracing"}
+
+// legacyTracefsNeeded reports whether tracefs should be mounted at /sys/kernel/debug/tracing:
+// the kernel offers tracefs, debugfs is mounted at /sys/kernel/debug, and nothing is mounted at
+// the legacy path yet. Pure, so the decision is unit-testable.
+func legacyTracefsNeeded(procMounts, procFilesystems string) bool {
+	debugfsMounted := false
+
+	for _, line := range strings.Split(procMounts, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+
+		if fields[1] == legacyTracefs.Target {
+			return false // already a mount (tracefs or anything else): leave it
+		}
+
+		if fields[1] == "/sys/kernel/debug" && fields[2] == "debugfs" {
+			debugfsMounted = true
+		}
+	}
+
+	return debugfsMounted && len(missingKernelFS("", procFilesystems, []kernelFS{legacyTracefs})) == 1
 }
