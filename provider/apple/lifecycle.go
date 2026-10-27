@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/netip"
 	"sort"
 )
 
@@ -150,5 +151,36 @@ func (p *provisioner) Start(ctx context.Context, stateDir, clusterName string, l
 		}
 	}
 
-	return nil
+	return p.refreshClusterHosts(ctx, state.Nodes, logw)
+}
+
+// refreshClusterHosts (v0.8.0) rewrites the k3ac-owned /etc/hosts lines on every k3s node with
+// the nodes' CURRENT IPs. A cold start moves DHCP IPs and resets /etc/hosts; when the vmnet
+// gateway resolver is unusable (-dns override, or the -egress relay forwarding DNS to the host)
+// the cluster FQDNs exist only in /etc/hosts, so without this an agent can never rejoin. With a
+// working container DNS the entries agree with it, so the refresh is harmless. No DNS domain =
+// IP-only cluster = nothing to do.
+func (p *provisioner) refreshClusterHosts(ctx context.Context, nodes []NodeInfo, logw io.Writer) error {
+	if p.dnsDomain == "" {
+		return nil
+	}
+
+	current := make([]NodeInfo, 0, len(nodes))
+	targets := make([]NodeInfo, 0, len(nodes))
+
+	for _, n := range nodes {
+		ip, err := p.waitForIPv4(ctx, n.ID)
+		if err != nil {
+			return fmt.Errorf("refreshing hosts: %w", err)
+		}
+
+		n.IPs = []netip.Addr{ip}
+		current = append(current, n)
+
+		if n.Role == RoleServer || n.Role == RoleAgent {
+			targets = append(targets, n)
+		}
+	}
+
+	return p.installClusterHosts(ctx, targets, current, logw)
 }

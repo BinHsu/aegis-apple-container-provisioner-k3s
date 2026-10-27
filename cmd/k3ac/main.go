@@ -129,6 +129,10 @@ func run() error {
 			return fmt.Errorf("stopping cluster %q: %w", *stopName, err)
 		}
 
+		if err := apple.DisableEgress(*stateDir, *stopName, log.Writer()); err != nil {
+			return fmt.Errorf("stopping egress relay of %q: %w", *stopName, err)
+		}
+
 		fmt.Printf("stopped cluster %q\n", *stopName)
 
 		return nil
@@ -137,6 +141,10 @@ func run() error {
 	if *startName != "" {
 		if err := prov.Start(ctx, *stateDir, *startName, log.Writer()); err != nil {
 			return fmt.Errorf("starting cluster %q: %w", *startName, err)
+		}
+
+		if err := maybeEnableEgress(ctx, prov, *stateDir, *startName, *nf.egress); err != nil {
+			return err
 		}
 
 		fmt.Printf("started cluster %q\n", *startName)
@@ -158,6 +166,10 @@ func run() error {
 	}
 
 	if *destroy {
+		if err := apple.DisableEgress(*stateDir, *clusterName, log.Writer()); err != nil {
+			return fmt.Errorf("stopping egress relay of %q: %w", *clusterName, err)
+		}
+
 		return runDestroy(ctx, prov, *stateDir, *clusterName)
 	}
 
@@ -201,7 +213,7 @@ func run() error {
 
 	// Default mode: create the cluster. The node set + ClusterConfig assembly and the Create call
 	// are extracted to runCreate so run() stays within the funlen budget.
-	return runCreate(ctx, prov, clusterConfigInputs{
+	if err := runCreate(ctx, prov, clusterConfigInputs{
 		name: *clusterName, image: *k3sImage, network: *network, stateDir: *stateDir,
 		token: *token, datastore: *datastore,
 		serverCount: *serverCount, datastoreMembers: *datastoreMembers,
@@ -213,7 +225,35 @@ func run() error {
 		serverCPUs: *serverCPUs, agentCPUs: *agentCPUs,
 		serverMemMB: *serverMemMB, agentMemMB: *agentMemMB,
 		labels: nodeLabels, serverArgs: serverArgs, agentArgs: agentArgs,
-	}, *dnsDomain)
+	}, *dnsDomain); err != nil {
+		return err
+	}
+
+	return maybeEnableEgress(ctx, prov, *stateDir, *clusterName, *nf.egress)
+}
+
+// egressEnabler is the egress capability maybeEnableEgress needs (the concrete *provisioner is
+// unexported, so it is passed through this interface).
+type egressEnabler interface {
+	EnableEgress(ctx context.Context, stateDir, clusterName string, logw io.Writer) error
+}
+
+// maybeEnableEgress starts the ac-egress relay when -egress was passed or the cluster's state
+// already records it (so a plain -start keeps a cluster that was created or started with -egress
+// working).
+func maybeEnableEgress(ctx context.Context, prov egressEnabler, stateDir, clusterName string, flagOn bool) error {
+	if !flagOn {
+		st, err := apple.LoadState(stateDir, clusterName)
+		if err != nil || !st.Egress {
+			return nil //nolint:nilerr // no state / not recorded = egress not requested
+		}
+	}
+
+	if err := prov.EnableEgress(ctx, stateDir, clusterName, log.Writer()); err != nil {
+		return fmt.Errorf("enabling egress for %q: %w", clusterName, err)
+	}
+
+	return nil
 }
 
 // loadAndApplyConfig loads the -config JSON file and applies its values to any flag the user did NOT
@@ -273,10 +313,12 @@ type day2FlagRefs struct {
 	force                                       *bool
 }
 
-// netFlagRefs are the v0.7.0 node-network flags for hosts behind TLS interception / a silent vmnet resolver.
+// netFlagRefs are the v0.7.0 node-network flags for hosts behind TLS interception / a silent vmnet resolver,
+// plus the v0.8.0 -egress relay switch.
 type netFlagRefs struct {
-	dns   *stringList
-	caDir *string
+	dns    *stringList
+	caDir  *string
+	egress *bool
 }
 
 // registerNetworkFlags declares -dns (repeatable) and -ca-dir. Kept out of run so it stays within funlen.
@@ -288,6 +330,8 @@ func registerNetworkFlags() netFlagRefs {
 	return netFlagRefs{
 		dns:   &dns,
 		caDir: flag.String("ca-dir", "", "absolute host dir holding ca-bundle.pem, trusted by every node for image pulls (TLS-interception proxies)"),
+		egress: flag.Bool("egress", false, "route node and pod egress through the host-side ac-egress relay (create/-start; "+
+			"remembered in state, stopped with -stop/-destroy). For hosts where vmnet NAT is dead but host sockets work, e.g. WARP on"),
 	}
 }
 

@@ -1021,15 +1021,23 @@ func validateCADir(dir string) error {
 	return nil
 }
 
-// writeClusterHosts appends "<ip> <fqdn> <name>" for every node to every node's /etc/hosts
+// hostsMarker tags every /etc/hosts line k3ac writes so a refresh can replace exactly its own lines.
+const hostsMarker = "# k3ac"
+
+// writeClusterHosts writes "<ip> <fqdn> <name> # k3ac" for every node into every node's /etc/hosts
 // (v0.7.0, DNS-override mode only). Agents that started before this runs keep retrying the server
-// and succeed once the entry exists. Entries are written at create time; a cold restart that moves
-// DHCP IPs needs a re-create (or a later -start refresh) in this mode.
+// and succeed once the entry exists. A cold restart moves DHCP IPs and resets /etc/hosts; Start
+// re-runs refreshClusterHosts (v0.8.0) to rewrite them.
 func (p *provisioner) writeClusterHosts(ctx context.Context, cfg ClusterConfig, nodes []NodeInfo, logw io.Writer) error {
 	if len(cfg.DNSServers) == 0 || p.dnsDomain == "" {
 		return nil
 	}
 
+	return p.installClusterHosts(ctx, nodes, nodes, logw)
+}
+
+// clusterHostsBlock renders the k3ac-owned /etc/hosts lines for nodes. Pure.
+func clusterHostsBlock(nodes []NodeInfo, domain string) string {
 	var lines strings.Builder
 
 	for _, n := range nodes {
@@ -1037,16 +1045,26 @@ func (p *provisioner) writeClusterHosts(ctx context.Context, cfg ClusterConfig, 
 			continue
 		}
 
-		fmt.Fprintf(&lines, "%s %s %s\n", n.IPs[0], nodeFQDN(n.Name, p.dnsDomain), n.Name)
+		fmt.Fprintf(&lines, "%s %s %s %s\n", n.IPs[0], nodeFQDN(n.Name, domain), n.Name, hostsMarker)
 	}
 
-	for _, n := range nodes {
-		if _, err := p.exec(ctx, n.ID, "sh", "-c", `printf '%s' "$1" >> /etc/hosts`, "sh", lines.String()); err != nil {
+	return lines.String()
+}
+
+// installClusterHosts replaces the k3ac-owned lines of /etc/hosts on every target with the block
+// for entries. /etc/hosts is a bind mount in the guest, so it is rewritten in place (cat >), never
+// renamed over (sed -i).
+func (p *provisioner) installClusterHosts(ctx context.Context, targets, entries []NodeInfo, logw io.Writer) error {
+	block := clusterHostsBlock(entries, p.dnsDomain)
+	script := `grep -v '` + hostsMarker + `$' /etc/hosts > /tmp/hosts.k3ac || true; printf '%s' "$1" >> /tmp/hosts.k3ac; cat /tmp/hosts.k3ac > /etc/hosts; rm -f /tmp/hosts.k3ac`
+
+	for _, n := range targets {
+		if _, err := p.exec(ctx, n.ID, "sh", "-c", script, "sh", block); err != nil {
 			return fmt.Errorf("writing /etc/hosts on %q: %w", n.Name, err)
 		}
 	}
 
-	fmt.Fprintf(logw, "wrote %d cluster host entries into each node's /etc/hosts\n", len(nodes))
+	fmt.Fprintf(logw, "wrote %d cluster host entries into each node's /etc/hosts\n", strings.Count(block, "\n"))
 
 	return nil
 }

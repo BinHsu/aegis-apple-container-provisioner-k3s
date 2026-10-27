@@ -212,4 +212,7 @@ type ClusterState struct {
 	PreviousImage string     `json:"previousImage,omitempty"`
 	ServerURL     string     `json:"serverURL"` // https://<server-fqdn>:6443 (FQDN or IP)
 	Nodes         []NodeInfo `json:"nodes"`
+	// Egress records that the cluster runs behind the ac-egress relay (v0.8.0, -egress), so a
+	// plain -start re-enables it. Pre-v0.8.0 states omit it and unmarshal to false.
+	Egress bool `json:"egress,omitempty"`
 }

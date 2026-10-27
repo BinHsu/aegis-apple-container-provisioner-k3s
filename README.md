@@ -45,6 +45,7 @@ A standalone launcher that boots k3s clusters as Apple Silicon micro-VMs via App
 
 | k3ac release | Apple `container` verified | k3s image | Notes |
 |---|---|---|---|
+| *unreleased (v0.8.0)* | 1.5.0 | `rancher/k3s:v1.32.5-k3s1` | Opt-in `-egress`: host-side `ac-egress` relay for hosts where vmnet NAT is dead (Cloudflare WARP connected). `-start` refreshes cluster `/etc/hosts`. See CHANGELOG |
 | **v0.7.0** | **1.5.0** | `rancher/k3s:v1.32.5-k3s1` | Required for 1.5.0: `/proc/sys` remount, `/` rshared, TSO/GSO off on node NIC. New opt-in `-dns` / `-ca-dir` for TLS-interception networks (e.g. Cloudflare WARP). See CHANGELOG |
 | v0.6.0 | 1.0.0 | `rancher/k3s:v1.32.5-k3s1` | day-2 operations |
 | v0.5.0 | 1.0.0 | `rancher/k3s:v1.32.5-k3s1` | |
@@ -468,6 +469,7 @@ values, which override built-in defaults.
 | `-list` | — | List all clusters under `-state-dir` (name, server/agent counts, URL, image) and exit. Pure file I/O — works with the `container` daemon down |
 | `-start` | `""` | Start every node of the named cluster in dependency-safe order (datastore → servers → agents). Re-arms `ip_forward` on each k3s node |
 | `-stop` | `""` | Stop every node of the named cluster in reverse order (agents → servers → datastore) |
+| `-egress` | `false` | Run the `ac-egress` relay for this cluster and steer node + pod egress through it (create or `-start`; recorded in state so later `-start`s re-enable it; `-stop`/`-destroy` stop it). See [Egress relay](#egress-relay-ac-egress) |
 | `-destroy` | `false` | Destroy the named cluster (nodes, etcd members, LB, named volumes, network, state dir) |
 | `-merge-kubeconfig` | `""` | Merge the named cluster's kubeconfig into `~/.kube/config` (via `kubectl`) and `set-context`, then exit |
 
@@ -494,6 +496,49 @@ plan and exits non-zero.
 | `-rotate-certs` | `""` | Regenerate + redeliver the managed etcd TLS bundle and rotate each server's k3s certs (DESTRUCTIVE, needs `-force`) |
 | `-rotate-token` | `""` | Generate a new K3S_TOKEN and re-register the named cluster's servers + agents (DESTRUCTIVE, needs `-force`) |
 | `-force` | `false` | Confirm a DESTRUCTIVE day-2 operation (`-restore`/`-upgrade`/`-rollback`/`-rotate-certs`/`-rotate-token`) |
+
+## Egress relay (`ac-egress`)
+
+On a Mac with Cloudflare WARP connected, Apple `container` VMs get **no egress at all**: DNS to
+public resolvers, TCP to literal IPs and ICMP to the vmnet gateway all time out, while ordinary
+host processes reach the internet fine. The VMs *can* still open TCP to the host's own bridge
+address (e.g. `192.168.200.1`). `ac-egress` uses exactly that path: a small userspace relay
+bound only to the bridge address, whose outbound connections are ordinary host sockets.
+
+It is a separate component (`egress/` package + `cmd/ac-egress`), stdlib-only, with no k3s
+knowledge — it serves any VM on the bridge it is bound to. k3ac only consumes it.
+
+| Port (bridge IP only) | Service |
+|---|---|
+| `15080/tcp` | transparent HTTP (routes by `Host`), plus explicit HTTP proxy (`CONNECT`, absolute-form) |
+| `15443/tcp` | transparent TLS passthrough routed by ClientHello SNI (never decrypts) |
+| `15053/udp+tcp` | DNS forwarder to the host's own resolvers (`/etc/resolv.conf`; WARP's 127.0.2.2/3) |
+
+Guests are steered to it by an iptables `nat` chain `AC-EGRESS` (hooked into `OUTPUT` and
+`PREROUTING`, so pods behind the node are covered too) that DNATs outbound tcp/80, tcp/443 and
+dns/53 to non-private destinations. Private ranges (pod/service CIDRs, node IPs, LAN) are never
+redirected, so no `HTTP_PROXY`/`NO_PROXY` is needed in any pod.
+
+Safety properties: refuses to bind anything but an address on a `bridge*` interface (never
+`0.0.0.0`, Wi-Fi, LAN, VPN or loopback); serves only sources inside that bridge's subnet; dials only
+public unicast upstreams (checked on the resolved IP, so a guest cannot reach host loopback or LAN
+services through it). TLS is passed through untouched, so a TLS-inspecting network still needs its
+CA in the guests (`-ca-dir`, and the CA in pods that verify TLS).
+
+```sh
+# k3ac: create or start a cluster behind the relay (state remembers it; -stop kills it by pid)
+go build -o _out/k3ac ./cmd/k3ac && go build -o _out/ac-egress ./cmd/ac-egress
+_out/k3ac -state-dir _out/clusters -start tw-poc -egress
+
+# standalone, for any Apple container VM on a network whose gateway is 192.168.200.1:
+_out/ac-egress -listen 192.168.200.1 &
+_out/ac-egress -listen 192.168.200.1 -guest-script | container exec -i <vm> sh
+```
+
+k3ac looks for `ac-egress` next to the `k3ac` binary, then on `PATH`. The relay runs detached
+(pid in `<state-dir>/<name>/egress.pid`, log in `egress.log`) and lives until `-stop`/`-destroy`.
+Not covered: HTTPS to literal IPs (no SNI), plain TCP on other ports, UDP other than DNS, IPv6.
+Design and alternatives: [`docs/ADR/0004-egress-relay.md`](docs/ADR/0004-egress-relay.md).
 
 ## Local checks
 

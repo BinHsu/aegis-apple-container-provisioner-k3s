@@ -4,6 +4,32 @@ All notable changes to k3ac are documented here. Format follows [Keep a Changelo
 
 ---
 
+## [Unreleased] — v0.8.0: egress relay for hosts where vmnet NAT is dead
+
+### Added
+
+- **`ac-egress`** (new command, package `egress/`, stdlib-only, no k3s knowledge): a userspace egress relay
+  bound only to a vmnet bridge address. Transparent HTTP (Host) + explicit HTTP/CONNECT proxy on 15080,
+  SNI-routed TLS passthrough on 15443, DNS forwarding to the host's resolvers on 15053 (udp+tcp).
+  `-guest-script` prints the iptables `AC-EGRESS` nat chain that steers a Linux guest's outbound 80/443/53
+  (non-private destinations only) to it. See docs/ADR/0004.
+- **`-egress`** (k3ac): on create or `-start`, starts `ac-egress` on the cluster network's gateway as a detached
+  process (pid file `egress.pid`), installs the guest chain on every k3s node, and records `egress: true` in
+  state so later `-start`s re-enable it. `-stop` and `-destroy` stop the relay by its recorded pid (verified to
+  be an `ac-egress` process first).
+
+### Fixed
+
+- **Agents could not rejoin after a cold restart when cluster FQDNs come only from `/etc/hosts`** (`-dns`
+  mode, or any network whose gateway resolver is silent). `/etc/hosts` is reset on boot and DHCP moves the IPs;
+  `-start` now rewrites the k3ac-owned (`# k3ac`-tagged) host lines on every k3s node with current IPs.
+
+Verified 2026-10-27 on macOS 27.0, apple/container 1.5.0, rancher/k3s v1.32.5-k3s1, Cloudflare WARP
+**Connected**, existing 1 server + 1 agent cluster: node `wget http://example.com`, pod HTTPS to an external API
+with the WARP CA, pod `pip download`, DataKit host metrics and app traces delivered; repeated after `-stop`/`-start`.
+
+---
+
 ## [v0.7.0] — apple/container 1.5.0 and TLS-interception networks
 
 ### Fixed
