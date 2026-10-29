@@ -543,8 +543,13 @@ _out/ac-egress -listen 192.168.200.1 &
 _out/ac-egress -listen 192.168.200.1 -guest-script | container exec -i <vm> sh
 ```
 
-k3ac looks for `ac-egress` next to the `k3ac` binary, then on `PATH`. The relay runs detached
-(pid in `<state-dir>/<name>/egress.pid`, log in `egress.log`) and lives until `-stop`/`-destroy`.
+k3ac looks for `ac-egress` next to the `k3ac` binary, then on `PATH`. The relay runs as a transient
+launchd job in your user domain (`launchctl print gui/$(id -u)/io.github.binhsu.k3ac.egress.<name>`;
+a copy of the binary, its plist and `egress.log` in `~/Library/Caches/k3ac/egress/<name>/`, pid in
+`<state-dir>/<name>/egress.pid`), so it survives the terminal that ran k3ac and lives until
+`-stop`/`-destroy` (or logout; it is never installed in `~/Library/LaunchAgents`). The copy matters when
+the checkout is under `~/Documents`: a launchd job started from there blocks on the Documents privacy check.
+Re-running `-start` keeps a healthy relay on the same gateway.
 Not covered: HTTPS to literal IPs (no SNI), plain TCP on other ports, UDP other than DNS, IPv6.
 Design and alternatives: [`docs/ADR/0004-egress-relay.md`](docs/ADR/0004-egress-relay.md).
 

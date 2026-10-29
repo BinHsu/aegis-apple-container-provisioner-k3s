@@ -67,3 +67,19 @@ guest traffic to it from inside the guest:
 - `-start` also rewrites the `# k3ac` lines of each node's `/etc/hosts` with current IPs: with
   DNS going to the host's resolvers, cluster FQDNs exist only in `/etc/hosts`, which a cold
   restart resets.
+
+## Addendum 2026-10-29: the relay runs under launchd, not as a k3ac child
+
+The first build started `ac-egress` with `setsid` from k3ac and recorded its pid. That outlives
+k3ac, but the relay still begins life inside whatever process tree ran k3ac (a terminal, an IDE, an
+agent host), and such hosts may reap their own trees. k3ac now hands the relay to launchd as a
+transient job in the user's domain (`gui/<uid>`, else `user/<uid>`), label
+`io.github.binhsu.k3ac.egress.<cluster>`. The job runs a copy of the binary from
+`~/Library/Caches/k3ac/egress/<cluster>/` (plist and log beside it): a launchd job is its own TCC
+responsible process, and started from a checkout under `~/Documents` it blocked in dyld's `open()`
+on the Documents privacy check (about 23 s once, until answered), while the same build outside
+`~/Documents` listened within 1 s. It is not persisted to
+`~/Library/LaunchAgents` (no login start, gone at logout), `KeepAlive` is off (a crash is visible,
+not looped), and stop is `launchctl bootout` of that label, so only that job's process is signalled.
+A repeated `-start` keeps a job that is running `ac-egress -listen <current gateway>`. Pid files
+from the setsid build are still stopped by verified pid. Network exposure is unchanged.

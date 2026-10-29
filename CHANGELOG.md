@@ -13,10 +13,15 @@ All notable changes to k3ac are documented here. Format follows [Keep a Changelo
   SNI-routed TLS passthrough on 15443, DNS forwarding to the host's resolvers on 15053 (udp+tcp).
   `-guest-script` prints the iptables `AC-EGRESS` nat chain that steers a Linux guest's outbound 80/443/53
   (non-private destinations only) to it. See docs/ADR/0004.
-- **`-egress`** (k3ac): on create or `-start`, starts `ac-egress` on the cluster network's gateway as a detached
-  process (pid file `egress.pid`), installs the guest chain on every k3s node, and records `egress: true` in
-  state so later `-start`s re-enable it. `-stop` and `-destroy` stop the relay by its recorded pid (verified to
-  be an `ac-egress` process first).
+- **`-egress`** (k3ac): on create or `-start`, runs `ac-egress` on the cluster network's gateway as a transient
+  launchd job in the user's domain (label `io.github.binhsu.k3ac.egress.<name>`; a copy of the binary, the plist
+  and `egress.log` in `~/Library/Caches/k3ac/egress/<name>/`, never in `~/Library/LaunchAgents`; pid file
+  `egress.pid` in the cluster state dir), installs the guest chain on every k3s node, and
+  records `egress: true` in state so later `-start`s re-enable it. The relay is not a child of k3ac or of the
+  shell that ran it, so closing that terminal or agent session does not stop egress. A second `-start` keeps a
+  healthy relay on the same gateway (and rebuilds the guest chain) instead of restarting it. `-stop` and
+  `-destroy` remove the job with `launchctl bootout`; a pid file from an older setsid-detached relay is still
+  honoured, by that pid only after verifying it is an `ac-egress` process.
 
 - **Nodes mount debugfs, tracefs and bpffs** (`/sys/kernel/debug`, `/sys/kernel/tracing`, `/sys/fs/bpf`) in the
   same preparation step as the v0.7.0 fixes (create, start, add, rotate, restore). Under apple/container
